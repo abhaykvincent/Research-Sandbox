@@ -1,4 +1,5 @@
 import sharp from 'sharp';
+import { logger } from './logger.js';
 
 const num = (v, dflt) => {
   const n = Number(v);
@@ -29,11 +30,15 @@ export function preprocessConfig() {
  * Returns { bytes, mimeType, width, height, resized }.
  * Falls back to the original bytes on any sharp failure (e.g. HEIC without libheif).
  */
-export async function preprocessImage(inputBytes, mimeType) {
+export async function preprocessImage(inputBytes, mimeType, ctx = '') {
   const originalBytes = inputBytes.length;
   const fallback = { bytes: inputBytes, mimeType, width: null, height: null, resized: false, originalBytes };
+  const tag = ctx ? `preprocess:${ctx}` : 'preprocess';
 
-  if (!PREPROCESS_ENABLED) return fallback;
+  if (!PREPROCESS_ENABLED) {
+    logger.debug(tag, 'skipped (EMBED_PREPROCESS=0)', { mimeType, originalBytes });
+    return fallback;
+  }
 
   try {
     const img = sharp(inputBytes, { failOn: 'none' });
@@ -41,23 +46,32 @@ export async function preprocessImage(inputBytes, mimeType) {
     const w = meta.width ?? null;
     const h = meta.height ?? null;
     const longest = Math.max(w ?? 0, h ?? 0);
+    logger.debug(tag, 'input meta', { mimeType, originalBytes, width: w, height: h, format: meta.format });
 
     // Already small JPEG within dim limits → send as-is.
     if (longest > 0 && longest <= PREPROCESS_MAX_DIM && originalBytes <= SKIP_UNDER_BYTES && mimeType === 'image/jpeg') {
+      logger.debug(tag, 'passthrough (already small)', { width: w, height: h, originalBytes });
       return { ...fallback, width: w, height: h };
     }
 
+    const t0 = Date.now();
     const { data, info } = await sharp(inputBytes, { failOn: 'none' })
       .resize({ width: PREPROCESS_MAX_DIM, height: PREPROCESS_MAX_DIM, fit: 'inside', withoutEnlargement: true })
       .jpeg({ quality: PREPROCESS_QUALITY, mozjpeg: true })
       .toBuffer({ resolveWithObject: true });
+    logger.debug(tag, 'resized', {
+      from: `${w}x${h}/${originalBytes}B`, to: `${info.width}x${info.height}/${data.length}B`,
+      savedPct: savingsPct(originalBytes, data.length), ms: Date.now() - t0,
+    });
 
     // Never make things worse — keep original if recompress grew the file.
     if (data.length >= originalBytes && longest <= PREPROCESS_MAX_DIM) {
+      logger.debug(tag, 'recompress grew file, keeping original', { originalBytes, recompressed: data.length });
       return { ...fallback, width: w, height: h };
     }
     return { bytes: data, mimeType: 'image/jpeg', width: info.width, height: info.height, resized: true, originalBytes };
-  } catch {
+  } catch (err) {
+    logger.warn(tag, 'sharp failed, using original bytes', { mimeType, originalBytes, error: err.message });
     return fallback;
   }
 }

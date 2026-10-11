@@ -5,6 +5,7 @@ import multer from 'multer';
 import { randomUUID } from 'node:crypto';
 import { EMBED_MODEL, MOCK_MODE, embedWithRetry, sha256 } from './lib/embed.js';
 import { preprocessImage, preprocessConfig, savingsPct } from './lib/image.js';
+import { logger } from './lib/logger.js';
 import { cacheGet, cacheSet, cacheStats, batchSave, batchGet } from './lib/batchStore.js';
 
 const app = express();
@@ -12,6 +13,13 @@ const PORT = process.env.PORT || 5050;
 
 app.use(cors());
 app.use(express.json({ limit: '25mb' }));
+
+// Request log: method + path + size hints (helps trace UI → API issues)
+app.use((req, _res, next) => {
+  const len = req.headers['content-length'];
+  logger.debug('http', `${req.method} ${req.path}`, len ? { contentLength: Number(len) } : undefined);
+  next();
+});
 
 // In-memory single-image jobs (M2). Batch jobs persist via batchStore (M3).
 const jobs = new Map();
@@ -43,6 +51,7 @@ const clamp = (n, lo, hi, dflt) => {
 };
 
 app.get('/api/health', (_req, res) => {
+  logger.debug('health', 'ping', { mock: MOCK_MODE, cache: cacheStats(), preprocess: preprocessConfig() });
   res.json({ ok: true, model: EMBED_MODEL, hasKey: Boolean(process.env.GEMINI_API_KEY), mock: MOCK_MODE, cache: cacheStats(), preprocess: preprocessConfig() });
 });
 
@@ -56,24 +65,33 @@ app.post('/api/embeddings', uploadSingle.single('image'), async (req, res) => {
       bytes = req.file.buffer; mimeType = req.file.mimetype;
       outputDimensionality = req.body.outputDimensionality ? Number(req.body.outputDimensionality) : undefined;
       includeVector = req.body.includeVector === 'true' || req.body.includeVector === true;
+      logger.debug('single', 'multipart input', { name: req.file.originalname, bytes: bytes.length, mimeType });
     } else if (req.body?.imageBase64) {
       bytes = Buffer.from(req.body.imageBase64, 'base64');
       mimeType = req.body.mimeType || 'image/jpeg';
       outputDimensionality = req.body.outputDimensionality ? Number(req.body.outputDimensionality) : undefined;
       includeVector = Boolean(req.body.includeVector);
+      logger.debug('single', 'JSON body input', { bytes: bytes.length, mimeType });
       if (bytes.length > 15 * 1024 * 1024) return res.status(413).json({ error: 'Image exceeds 15 MB limit' });
     } else {
+      logger.warn('single', 'no image supplied', { jobId: jobId.slice(0, 8), hasFile: Boolean(req.file), bodyKeys: Object.keys(req.body ?? {}) });
       return res.status(400).json({ error: 'Send multipart `image` file or JSON { imageBase64, mimeType }' });
     }
-    if (outputDimensionality !== undefined && !(outputDimensionality >= 128 && outputDimensionality <= 3072))
+    if (outputDimensionality !== undefined && !(outputDimensionality >= 128 && outputDimensionality <= 3072)) {
+      logger.warn('single', 'bad outputDimensionality', { jobId: jobId.slice(0, 8), outputDimensionality });
       return res.status(400).json({ error: 'outputDimensionality must be 128–3072' });
+    }
 
     jobs.set(jobId, { jobId, status: 'processing', createdAt: new Date().toISOString() });
+    logger.info('single', 'job start', {
+      jobId: jobId.slice(0, 8), via: req.file ? `multipart:${req.file.originalname}` : 'json',
+      bytes: bytes.length, mimeType, outputDimensionality: outputDimensionality ?? 768,
+    });
     // Cost optimization: downscale + JPEG-recompress before the Gemini call.
     // Embeddings don't need full-res originals; 1024px q80 is ~5–15x smaller.
     const originalBytes = bytes.length;
     const originalMimeType = mimeType;
-    const pre = await preprocessImage(bytes, mimeType);
+    const pre = await preprocessImage(bytes, mimeType, `single:${jobId.slice(0, 8)}`);
     bytes = pre.bytes;
     mimeType = pre.mimeType;
     const sentBytes = bytes.length;
@@ -81,8 +99,11 @@ app.post('/api/embeddings', uploadSingle.single('image'), async (req, res) => {
     const dims = outputDimensionality ?? 768;
     let values, cacheHit = false, attempts = 1;
     const cached = cacheGet(hash, dims);
-    if (cached) { values = cached.values; cacheHit = true; }
-    else {
+    if (cached) {
+      values = cached.values; cacheHit = true;
+      logger.info('single', 'cache HIT — skipping Gemini', { jobId: jobId.slice(0, 8), hash: hash.slice(0, 8), dims });
+    } else {
+      logger.debug('single', 'cache MISS — calling Gemini', { jobId: jobId.slice(0, 8), hash: hash.slice(0, 8), sentBytes, mimeType });
       const r = await embedWithRetry({ bytes, mimeType, outputDimensionality, fileHash: hash }, 2);
       values = r.values; attempts = r.attempts;
       cacheSet(hash, { values, dimension: values.length, model: EMBED_MODEL, cachedAt: new Date().toISOString() });
@@ -91,8 +112,10 @@ app.post('/api/embeddings', uploadSingle.single('image'), async (req, res) => {
     const job = { jobId, status: 'succeeded', model: EMBED_MODEL, mimeType: originalMimeType, sizeBytes: originalBytes, sentBytes, bytesSavedPct: savingsPct(originalBytes, sentBytes), resized: pre.resized, sentWidth: pre.width, sentHeight: pre.height, dimension: values.length, outputDimensionality: outputDimensionality ?? null, processingTimeMs, cacheHit, attempts, createdAt: new Date().toISOString(), vectorPreview: values.slice(0, 12), _vector: values };
     jobs.set(jobId, job);
     const { _vector, ...pub } = job;
+    logger.info('single', 'job done', { jobId: jobId.slice(0, 8), dim: values.length, ms: processingTimeMs, cacheHit, attempts, savedPct: job.bytesSavedPct });
     res.json({ ...pub, vector: includeVector ? values : undefined });
   } catch (err) {
+    logger.error('single', 'job FAILED', { jobId: jobId.slice(0, 8), ms: Date.now() - started, error: err.message, stack: err.stack?.split('\n').slice(0, 3).join(' | ') });
     jobs.set(jobId, { jobId, status: 'failed', error: err.message, processingTimeMs: Date.now() - started });
     res.status(err.status || 502).json({ jobId, error: err.message });
   }
@@ -119,24 +142,29 @@ function publicBatch(batch, includeVectors = false) {
 }
 
 async function runBatch(batch, { concurrency, maxRetries }) {
+  logger.info('batch', 'run start', { batchId: batch.batchId.slice(0, 8), total: batch.items.length, concurrency, maxRetries });
   batch.status = 'processing';
   batch.updatedAt = new Date().toISOString();
   batchSave(batch);
 
   const queue = batch.items.filter((it) => it.status === 'pending' || it.status === 'failed');
+  logger.debug('batch', 'queue built', { batchId: batch.batchId.slice(0, 8), queued: queue.length });
   for (const it of queue) {
     if (it.status === 'failed') { it.status = 'pending'; it.error = null; }
   }
   batchSave(batch);
 
   let cursor = 0;
-  const workers = Array.from({ length: concurrency }, async () => {
+  const workers = Array.from({ length: concurrency }, async (__, wIdx) => {
+    logger.debug('batch', `worker ${wIdx} started`, { batchId: batch.batchId.slice(0, 8) });
     while (cursor < queue.length) {
       const item = queue[cursor++];
       const started = Date.now();
       item.status = 'processing';
+      logger.debug('batch', 'item start', { batch: batch.batchId.slice(0, 8), file: item.fileName, idx: `${cursor}/${queue.length}` });
       try {
         const buf = batch.buffers[item.fileName];
+        if (!buf) logger.warn('batch', 'buffer missing for item', { batch: batch.batchId.slice(0, 8), file: item.fileName });
         // Preprocess first so cache key + Gemini bytes are the compressed form.
         let procBytes = null;
         let procMime = item.mimeType;
@@ -144,7 +172,7 @@ async function runBatch(batch, { concurrency, maxRetries }) {
         let sentWidth = null;
         let sentHeight = null;
         if (buf) {
-          const pre = await preprocessImage(Buffer.from(buf, 'base64'), item.mimeType);
+          const pre = await preprocessImage(Buffer.from(buf, 'base64'), item.mimeType, `batch:${item.fileName}`);
           procBytes = pre.bytes;
           procMime = pre.mimeType;
           resized = pre.resized;
@@ -161,8 +189,10 @@ async function runBatch(batch, { concurrency, maxRetries }) {
           item._vector = cached.values;
           item.cacheHit = true;
           item.attempts = 0;
+          logger.debug('batch', 'item cache HIT', { file: item.fileName });
         } else {
           if (!procBytes) throw new Error('File bytes expired (server restarted). Re-upload to resume.');
+          logger.debug('batch', 'item cache MISS — embedding', { file: item.fileName, sentBytes: procBytes.length, mime: procMime });
           const r = await embedWithRetry(
             { bytes: procBytes, mimeType: procMime, outputDimensionality: batch.outputDimensionality, fileHash: item.sha256 },
             maxRetries,
@@ -175,10 +205,12 @@ async function runBatch(batch, { concurrency, maxRetries }) {
         item.status = 'succeeded';
         item.dimension = item._vector.length;
         item.vectorPreview = item._vector.slice(0, 12);
+        logger.debug('batch', 'item ok', { file: item.fileName, dim: item.dimension, ms: Date.now() - started, cacheHit: item.cacheHit, attempts: item.attempts });
       } catch (err) {
         item.status = 'failed';
         item.error = err.message;
         item.attempts = err.attempts ?? maxRetries + 1;
+        logger.error('batch', 'item FAILED', { file: item.fileName, ms: Date.now() - started, error: err.message });
       }
       item.processingTimeMs = Date.now() - started;
       batch.completed = batch.items.filter((i) => i.status === 'succeeded').length;
@@ -193,6 +225,7 @@ async function runBatch(batch, { concurrency, maxRetries }) {
   batch.pending = batch.items.filter((i) => i.status === 'pending' || i.status === 'processing').length;
   batch.status = batch.failed > 0 ? 'completed_with_errors' : 'succeeded';
   batch.updatedAt = new Date().toISOString();
+  logger.info('batch', 'run done', { batchId: batch.batchId.slice(0, 8), status: batch.status, ok: batch.completed, failed: batch.failed });
   // Drop raw buffers once done to bound memory; cache covers future retries.
   // Keep buffers if failures remain so /retry can proceed without re-upload.
   if (batch.failed === 0) batch.buffers = {};
@@ -230,13 +263,16 @@ app.post('/api/batch-jobs', uploadBatch.array('images', 50), async (req, res) =>
     }
     batches.set(batchId, batch);
     batchSave(batch);
+    logger.info('batch', 'created', { batchId: batchId.slice(0, 8), total: files.length, dims: outputDimensionality, concurrency, maxRetries, names: files.map((f) => f.originalname).slice(0, 5) });
     res.status(202).json({ batchId, total: batch.total, status: 'queued' });
     runBatch(batch, { concurrency, maxRetries }).catch((err) => {
+      logger.error('batch', 'run crashed', { batchId: batchId.slice(0, 8), error: err.message, stack: err.stack?.split('\n').slice(0, 3).join(' | ') });
       batch.status = 'failed';
       batch.error = err.message;
       batchSave(batch);
     });
   } catch (err) {
+    logger.error('batch', 'create FAILED', { error: err.message });
     res.status(400).json({ error: err.message });
   }
 });
@@ -256,15 +292,23 @@ app.post('/api/batch-jobs/:batchId/retry', (req, res) => {
   if (failed === 0) return res.json({ batchId: batch.batchId, retried: 0, status: batch.status });
   if (Object.keys(batch.buffers ?? {}).length === 0)
     return res.status(410).json({ error: 'Original bytes expired after restart. Re-upload the shoot to resume.' });
+  logger.info('batch', 'retry requested', { batchId: batch.batchId.slice(0, 8), retried: failed });
   res.json({ batchId: batch.batchId, retried: failed, status: 'processing' });
-  runBatch(batch, { concurrency: batch.concurrency, maxRetries: batch.maxRetries }).catch(() => {});
+  runBatch(batch, { concurrency: batch.concurrency, maxRetries: batch.maxRetries }).catch((err) => {
+    logger.error('batch', 'retry run crashed', { batchId: batch.batchId.slice(0, 8), error: err.message });
+  });
 });
 
 // eslint-disable-next-line no-unused-vars
 app.use((err, _req, res, _next) => {
+  logger.error('http', 'unhandled route error', { error: err.message, stack: err.stack?.split('\n').slice(0, 3).join(' | ') });
   res.status(400).json({ error: err.message });
 });
 
+process.on('unhandledRejection', (reason) => {
+  logger.error('process', 'unhandledRejection', { reason: String(reason)?.slice(0, 500) });
+});
+
 app.listen(PORT, () => {
-  console.log(`[api] listening on http://localhost:${PORT} (model=${EMBED_MODEL}${MOCK_MODE ? ', MOCK' : ''})`);
+  logger.info('api', `listening on http://localhost:${PORT}`, { model: EMBED_MODEL, mock: MOCK_MODE, logLevel: logger.level, preprocess: preprocessConfig() });
 });
