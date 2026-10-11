@@ -2,6 +2,8 @@
 
 Isolated prototype for Gemini-embedding experiments. Separate repo / Firebase project — no production FotoFlow code or data.
 
+See [docs/prototype-plan.md](docs/prototype-plan.md) for the full prototype plan (stack, structure, tooling, milestones).
+
 ## Scope: Milestones 1–3
 
 - **M1 — Development foundation:** React + SCSS + Redux Toolkit, Node + Express API, env vars, local scripts.
@@ -10,7 +12,7 @@ Isolated prototype for Gemini-embedding experiments. Separate repo / Firebase pr
 
 Do not add clustering, vector DBs, storytelling, or Cloud Functions until M3 is verified.
 
-## Quickstart
+## Quickstart8u4
 
 ```bash
 npm run install:all

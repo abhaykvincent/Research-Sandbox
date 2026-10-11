@@ -80,6 +80,12 @@ export const cancelBatch = createAsyncThunk('batch/cancel', async (batchId, { re
 });
 
 const TERMINAL = ['succeeded', 'completed_with_errors', 'failed', 'cancelled'];
+// Transient network blips (incl. a nodemon restart mid-batch) shouldn't kill
+// the watch: tolerate this many consecutive fetch failures before stopping.
+const MAX_FETCH_FAILURES = 5;
+
+const isNetworkError = (msg) =>
+  /failed to fetch|networkerror|load failed|err_connection_refused|timeout/i.test(msg || '');
 
 const batchSlice = createSlice({
   name: 'batch',
@@ -89,6 +95,7 @@ const batchSlice = createSlice({
     status: 'idle', // idle | uploading | polling | succeeded | completed_with_errors | failed
     error: null,
     polling: false,
+    fetchFailures: 0,
   },
   reducers: {
     setBatchId(state, action) {
@@ -120,9 +127,16 @@ const batchSlice = createSlice({
         state.status = 'polling';
         state.polling = true;
       })
-      .addCase(createBatch.rejected, (state, action) => { state.status = 'failed'; state.error = action.payload; })
+      .addCase(createBatch.rejected, (state, action) => {
+        state.status = 'failed';
+        state.error = isNetworkError(action.payload)
+          ? `${action.payload}. Is services/api running? Start it with \`npm run dev:api\` and retry.`
+          : action.payload;
+      })
       .addCase(fetchBatch.fulfilled, (state, action) => {
         state.batch = action.payload;
+        state.fetchFailures = 0;
+        state.error = null;
         if (TERMINAL.includes(action.payload.status)) {
           state.status = action.payload.status;
           state.polling = false;
@@ -132,7 +146,31 @@ const batchSlice = createSlice({
           state.polling = true;
         }
       })
-      .addCase(fetchBatch.rejected, (state, action) => { state.error = action.payload; state.polling = false; })
+      .addCase(fetchBatch.rejected, (state, action) => {
+        const msg = action.payload || 'Fetch failed';
+        if (msg.includes('Unknown batchId')) {
+          // Server restarted and lost the job (registry fell back empty).
+          // Retrying can't work — re-upload instead (cache makes it instant).
+          state.polling = false;
+          state.status = 'failed';
+          state.error = 'Job not found on the server — it likely restarted mid-batch. Re-upload the files (completed ones hit cache and finish instantly), or Dismiss.';
+          return;
+        }
+        if (isNetworkError(msg)) {
+          state.fetchFailures += 1;
+          if (state.fetchFailures <= MAX_FETCH_FAILURES) {
+            // Stay watching through restarts/blips; the interval keeps ticking.
+            state.polling = true;
+            state.error = `API unreachable (retry ${state.fetchFailures}/${MAX_FETCH_FAILURES}) — still watching…`;
+            return;
+          }
+          state.polling = false;
+          state.error = 'API unreachable after several retries. Check the services/api terminal (it likely crashed), restart it with `npm run dev:api`, then press Resume job.';
+          return;
+        }
+        state.error = msg;
+        state.polling = false;
+      })
       .addCase(retryBatch.fulfilled, (state) => { state.status = 'polling'; state.polling = true; })
       .addCase(retryBatch.rejected, (state, action) => { state.error = action.payload; })
       .addCase(cancelBatch.pending, (state) => { state.status = 'cancelling'; })

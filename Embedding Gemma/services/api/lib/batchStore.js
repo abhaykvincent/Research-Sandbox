@@ -25,8 +25,11 @@ const MAX_STORED_BATCHES = 20;
 
 function loadJson(path, fallback) {
   try {
-    if (!existsSync(path)) return fallback;
-    return JSON.parse(readFileSync(path, 'utf8'));
+    if (existsSync(path)) return JSON.parse(readFileSync(path, 'utf8'));
+    // Live file missing (kill landed between the two renames in saveJsonAtomic
+    // or first boot) — fall back to previous good copy before giving up.
+    if (existsSync(path + '.bak')) return JSON.parse(readFileSync(path + '.bak', 'utf8'));
+    return fallback;
   } catch {
     // Main file torn by a mid-write kill — fall back to previous good copy.
     try {
@@ -97,11 +100,19 @@ function persistNow() {
       .sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1))
       .map((b) => b.batchId);
     for (const id of ids.slice(MAX_STORED_BATCHES)) delete batches[id];
-    // Strip full vectors before writing to disk (vectors stay in memory;
-    // re-fetch with ?includeVectors=true only while server runs; cache covers resume)
+    // Strip full vectors AND raw upload bytes before writing to disk.
+    // Vectors stay in memory; bytes stay in memory only. Persisting base64
+    // buffers ballooned the registry to tens of MB (2 wedding JPEGs ≈ 13MB),
+    // blocking the event loop on every sync write — that OOM/crash is what
+    // killed the server mid-batch. After a restart, retry/re-upload is the
+    // recovery path (SHA-256 cache makes re-uploads instant); the orphaned
+    // startup check fails such items fast with a clear message instead of
+    // hanging the UI on polling forever.
     const slim = {};
     for (const [id, b] of Object.entries(batches)) {
-      slim[id] = { ...b, items: b.items.map(({ _vector, ...rest }) => rest) };
+      const { buffers, ...noBuf } = b;
+      void buffers;
+      slim[id] = { ...noBuf, buffers: {}, items: b.items.map(({ _vector, ...rest }) => rest) };
     }
     saveJson(batchFile, slim);
   } catch { /* ignore */ }
