@@ -10,6 +10,7 @@ import { EMBED_MODEL, MOCK_MODE, embedWithRetry, sha256 } from './lib/embed.js';
 import { preprocessImage, preprocessConfig, savingsPct, makeThumbnail } from './lib/image.js';
 import { logger } from './lib/logger.js';
 import { cacheGet, cacheSet, cacheStats, batchSave, batchSaveNow, batchGet, batchList } from './lib/batchStore.js';
+import { buildStory } from './lib/story.js';
 
 const app = express();
 const PORT = process.env.PORT || 5050;
@@ -300,6 +301,16 @@ app.post('/api/batch-jobs', uploadBatch.array('images', 50), async (req, res) =>
     const outputDimensionality = clamp(req.body.outputDimensionality, 128, 3072, 768);
     const concurrency = clamp(req.body.concurrency, 1, 8, 4);
     const maxRetries = clamp(req.body.maxRetries, 0, 5, 2);
+    // M6 storytelling needs capture order: the web app sends
+    // `timestamps` as JSON { fileName: lastModifiedMs }. Best-effort parse —
+    // old clients simply omit it and items fall back to name ordering.
+    let timestamps = {};
+    if (req.body.timestamps) {
+      try {
+        const parsed = JSON.parse(req.body.timestamps);
+        if (parsed && typeof parsed === 'object') timestamps = parsed;
+      } catch { /* ignore — chrono falls back to file names */ }
+    }
     const batchId = randomUUID();
     const batch = {
       batchId, status: 'queued', model: EMBED_MODEL,
@@ -311,6 +322,7 @@ app.post('/api/batch-jobs', uploadBatch.array('images', 50), async (req, res) =>
         jobId: randomUUID(), fileName: f.originalname, mimeType: f.mimetype,
         sizeBytes: f.size, originalBytes: f.size, sentBytes: null, bytesSavedPct: null, resized: false,
         sha256: sha256(f.buffer),
+        capturedAt: Number(timestamps[f.originalname]) > 0 ? Number(timestamps[f.originalname]) : null,
         status: 'pending', dimension: null, processingTimeMs: null,
         attempts: 0, cacheHit: false, error: null, vectorPreview: null, _vector: null,
       })),
@@ -403,6 +415,54 @@ app.post('/api/batch-jobs/:batchId/retry', (req, res) => {
   runBatch(batch, { concurrency: batch.concurrency, maxRetries: batch.maxRetries }).catch((err) => {
     logger.error('batch', 'retry run crashed', { batchId: batch.batchId.slice(0, 8), error: err.message });
   });
+});
+
+// ---------- M6: storytelling ----------
+// POST /api/story-sequence — draft highlight reel from embedding geometry.
+// Body: { batchId?, items?: [{ name, vector, capturedAt? }], k?, targetCount?, ordering?, seed? }
+// batchId path rehydrates vectors from the SHA-256 cache so the call works
+// after restarts; items path supports direct-upload flows without a batch.
+app.post('/api/story-sequence', (req, res) => {
+  try {
+    const { batchId, items: rawItems, k, targetCount, ordering, seed } = req.body ?? {};
+    let items = null;
+    let source = null;
+    if (batchId) {
+      const batch = batches.get(batchId) ?? batchGet(batchId);
+      if (!batch) return res.status(404).json({ error: 'Unknown batchId' });
+      const dims = batch.outputDimensionality;
+      items = (batch.items ?? [])
+        .filter((i) => i.status === 'succeeded')
+        .map((i) => {
+          const vec = i._vector ?? (i.sha256 ? cacheGet(i.sha256, dims)?.values : null);
+          return vec?.length ? { name: i.fileName, vector: vec, capturedAt: i.capturedAt ?? null } : null;
+        })
+        .filter(Boolean);
+      source = 'batch';
+      if (items.length < 2) {
+        return res.status(422).json({ error: `Batch has ${items.length} usable vectors — need ≥2 succeeded photos with vectors (re-upload or retry first).` });
+      }
+      const dimSet = new Set(items.map((i) => i.vector.length));
+      if (dimSet.size > 1) return res.status(422).json({ error: `Mixed vector dims in batch (${[...dimSet].join(', ')}). Re-run with one dims setting.` });
+    } else if (Array.isArray(rawItems)) {
+      items = rawItems
+        .filter((i) => i && typeof i.name === 'string' && Array.isArray(i.vector) && i.vector.length > 0)
+        .map((i) => ({ name: i.name, vector: i.vector.map(Number), capturedAt: Number(i.capturedAt) > 0 ? Number(i.capturedAt) : null }));
+      source = 'items';
+    } else {
+      return res.status(400).json({ error: 'Send { batchId } or { items: [{ name, vector, capturedAt? }] }' });
+    }
+    const story = buildStory(items, { k, targetCount, ordering, seed });
+    logger.info('story', 'sequence built', {
+      source, batch: batchId ? batchId.slice(0, 8) : undefined,
+      n: story.count, k: story.k, picks: story.sequence.length, ordering: story.ordering,
+      coverage: story.scores.coverage.toFixed(2), flow: story.scores.flow.toFixed(2),
+    });
+    res.json({ storyId: randomUUID(), batchId: batchId ?? null, source, generatedAt: new Date().toISOString(), model: EMBED_MODEL, ...story });
+  } catch (err) {
+    logger.warn('story', 'build FAILED', { error: err.message });
+    res.status(400).json({ error: err.message });
+  }
 });
 
 // Recover in-memory registry + resume batches orphaned by a restart
