@@ -3,8 +3,11 @@ import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
 import { randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { EMBED_MODEL, MOCK_MODE, embedWithRetry, sha256 } from './lib/embed.js';
-import { preprocessImage, preprocessConfig, savingsPct } from './lib/image.js';
+import { preprocessImage, preprocessConfig, savingsPct, makeThumbnail } from './lib/image.js';
 import { logger } from './lib/logger.js';
 import { cacheGet, cacheSet, cacheStats, batchSave, batchSaveNow, batchGet, batchList } from './lib/batchStore.js';
 
@@ -128,11 +131,41 @@ app.get('/api/jobs/:jobId', (req, res) => {
   res.json({ ...pub, vector: req.query.includeVector === 'true' ? _vector : undefined });
 });
 
+// Disk previews for cluster/inspector grids. Keyed by item jobId (not the
+// user-supplied fileName) so the thumb route can't be abused for path
+// traversal. ~20KB per photo — survives restarts, unlike in-memory buffers.
+const thumbsRoot = join(dirname(fileURLToPath(import.meta.url)), 'data', 'thumbs');
+mkdirSync(thumbsRoot, { recursive: true });
+
+function thumbPath(batchId, jobId) {
+  return join(thumbsRoot, batchId, `${jobId}.jpg`);
+}
+
+function thumbExists(batchId, jobId) {
+  try {
+    return existsSync(thumbPath(batchId, jobId));
+  } catch {
+    return false;
+  }
+}
+
+async function saveThumb(batchId, item, originalBytes) {
+  try {
+    const thumb = await makeThumbnail(originalBytes, `${batchId.slice(0, 8)}:${item.fileName}`);
+    if (!thumb) return;
+    mkdirSync(join(thumbsRoot, batchId), { recursive: true });
+    writeFileSync(thumbPath(batchId, item.jobId), thumb);
+  } catch (err) {
+    logger.warn('thumb', 'save failed (embedding unaffected)', { file: item.fileName, error: err.message });
+  }
+}
+
 // ---------- M3: batch jobs ----------
 function publicBatch(batch, includeVectors = false) {
   return {
     ...batch,
     buffers: undefined,
+    hasThumbs: batch.items.filter((it) => it.status === 'succeeded' && thumbExists(batch.batchId, it.jobId)).length,
     items: batch.items.map((it) => {
       // Vectors are stripped from disk persistence; rehydrate from the
       // SHA-256 cache so ?includeVectors=true survives server restarts.
@@ -142,6 +175,7 @@ function publicBatch(batch, includeVectors = false) {
         ...it,
         _vector: undefined,
         vector: includeVectors ? (vec ?? undefined) : undefined,
+        hasThumb: it.status === 'succeeded' ? thumbExists(batch.batchId, it.jobId) : false,
       };
     }),
   };
@@ -222,6 +256,9 @@ async function runBatch(batch, { concurrency, maxRetries }) {
         item.status = 'succeeded';
         item.dimension = item._vector.length;
         item.vectorPreview = item._vector.slice(0, 12);
+        // Preview for the cluster/inspector grids — generated from the
+        // original upload (not the embedding bytes) before buffers are dropped.
+        if (buf) await saveThumb(batch.batchId, item, Buffer.from(buf, 'base64'));
         logger.debug('batch', 'item ok', { file: item.fileName, dim: item.dimension, ms: Date.now() - started, cacheHit: item.cacheHit, attempts: item.attempts });
       } catch (err) {
         item.status = 'failed';
@@ -306,6 +343,21 @@ app.get('/api/batch-jobs/:batchId', (req, res) => {
   const batch = batches.get(req.params.batchId) ?? batchGet(req.params.batchId);
   if (!batch) return res.status(404).json({ error: 'Unknown batchId' });
   res.json(publicBatch(batch, req.query.includeVectors === 'true'));
+});
+
+/** GET /api/batch-jobs/:batchId/thumb?file=<fileName> — 320px JPEG preview for grids. */
+app.get('/api/batch-jobs/:batchId/thumb', (req, res) => {
+  const batch = batches.get(req.params.batchId) ?? batchGet(req.params.batchId);
+  if (!batch) return res.status(404).json({ error: 'Unknown batchId' });
+  const item = (batch.items ?? []).find((i) => i.fileName === req.query.file);
+  if (!item) return res.status(404).json({ error: 'Unknown file in this batch' });
+  const path = thumbPath(batch.batchId, item.jobId);
+  if (!thumbExists(batch.batchId, item.jobId)) {
+    return res.status(404).json({ error: 'No preview for this file (batch predates previews — re-process to generate).' });
+  }
+  res.setHeader('Content-Type', 'image/jpeg');
+  res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
+  res.sendFile(path);
 });
 
 /** POST /api/batch-jobs/:batchId/cancel — stop a queued/processing batch. Pending items → cancelled. */

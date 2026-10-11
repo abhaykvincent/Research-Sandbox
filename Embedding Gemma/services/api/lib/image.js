@@ -80,3 +80,22 @@ export function savingsPct(originalBytes, sentBytes) {
   if (!originalBytes || sentBytes >= originalBytes) return 0;
   return Math.round((1 - sentBytes / originalBytes) * 100);
 }
+
+/**
+ * Small preview for cluster/inspector grids. 320px JPEG q70 is ~15–30KB —
+ * ~50x smaller than the original, so keeping one per photo is cheap.
+ * Returns a Buffer, or null when sharp can't decode (caller keeps going —
+ * a missing preview must never fail an embedding).
+ */
+export async function makeThumbnail(inputBytes, ctx = '') {
+  try {
+    const { data } = await sharp(inputBytes, { failOn: 'none' })
+      .resize({ width: 320, height: 320, fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality: 70, mozjpeg: true })
+      .toBuffer({ resolveWithObject: true });
+    return data;
+  } catch (err) {
+    logger.warn(ctx ? `thumb:${ctx}` : 'thumb', 'thumbnail failed, skipping preview', { error: err.message });
+    return null;
+  }
+}

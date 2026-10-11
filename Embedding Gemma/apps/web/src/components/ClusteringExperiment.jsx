@@ -19,6 +19,23 @@ async function embedFile(file, dims) {
   return { name: file.name, vector: data.vector, dim: data.dimension, file };
 }
 
+/** Deterministic placeholder so a tile always shows an image, even when the
+ *  server preview 404s (old batch) or a local object URL was revoked. */
+function placeholderFor(name = '?') {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+  const hue = h % 360;
+  const initial = (name.split('/').pop()?.[0] ?? '?').toUpperCase();
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="240"><rect width="100%" height="100%" fill="hsl(${hue},30%,22%)"/><text x="50%" y="54%" font-family="sans-serif" font-size="96" font-weight="700" fill="hsl(${hue},60%,75%)" text-anchor="middle" dominant-baseline="middle">${initial}</text></svg>`;
+  return `data:image/svg+xml,${encodeURIComponent(svg)}`;
+}
+
+function ThumbImg({ src, alt, className }) {
+  const [err, setErr] = useState(false);
+  useEffect(() => setErr(false), [src]);
+  return <img src={err || !src ? placeholderFor(alt) : src} alt={alt} loading="lazy" onError={() => setErr(true)} className={className} />;
+}
+
 export default function ClusteringExperiment() {
   const { batchId, batch } = useSelector((s) => s.batch);
   const [items, setItems] = useState([]); // { name, vector, dim, thumbUrl? }
@@ -46,30 +63,52 @@ export default function ClusteringExperiment() {
     });
   };
 
+  // Locally attached files win; otherwise use the server preview so
+  // batch c-thumbs show the actual photo without any manual attach step.
+  const serverThumb = (batchIdFor, name) =>
+    batchIdFor ? `${API_URL}/api/batch-jobs/${batchIdFor}/thumb?file=${encodeURIComponent(name)}` : null;
+
   const withThumbs = (list) => list.map((it) => ({ ...it, thumbUrl: urls[it.name] ?? it.thumbUrl }));
+
+  const [thumbNote, setThumbNote] = useState(null);
 
   const loadBatch = async () => {
     if (!batchId) return;
     setStatus('loading');
     setError(null);
     setSweep(null);
+    setThumbNote(null);
     try {
       blog.log('cluster loading batch vectors', { batchId: batchId.slice(0, 8) });
       const res = await fetch(`${API_URL}/api/batch-jobs/${batchId}?includeVectors=true`);
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || `Fetch failed: ${res.status}`);
       const vec = (data.items ?? [])
-        .map((i) => ({ name: i.fileName, vector: i.vector ?? i._vector, dim: (i.vector ?? i._vector)?.length }))
+        .map((i) => ({
+          name: i.fileName,
+          vector: i.vector ?? i._vector,
+          dim: (i.vector ?? i._vector)?.length,
+          // The server thumb is the only image we have for batch photos —
+          // always point at it; a placeholder covers the 404 case below.
+          thumbUrl: serverThumb(batchId, i.fileName),
+          hasThumb: i.hasThumb !== false,
+        }))
         .filter((i) => i.vector?.length);
       if (vec.length < 3) throw new Error(`Need ≥3 vectors to cluster (got ${vec.length})`);
       if (new Set(vec.map((v) => v.vector.length)).size > 1) throw new Error('Mixed vector dims — re-run batch with one dims setting');
+      const withPreview = vec.filter((v) => v.hasThumb).length;
+      if (withPreview < vec.length) {
+        setThumbNote(
+          `${vec.length - withPreview} photo(s) predate server previews — showing placeholders until you re-process the shoot or attach thumbnails below.`,
+        );
+      }
       setItems(vec);
       setSource('batch');
       setK(Math.min(3, vec.length - 1));
       setSel(null);
       setFilter(null);
       setStatus('ready');
-      blog.log('cluster batch loaded', { n: vec.length });
+      blog.log('cluster batch loaded', { n: vec.length, withPreview });
     } catch (err) {
       setStatus('failed');
       setError(err.message);
@@ -217,6 +256,7 @@ export default function ClusteringExperiment() {
         </div>
       )}
       {error && <p className="error">Error: {error}</p>}
+      {thumbNote && <p className="warn">{thumbNote}</p>}
       {result?.error && <p className="error">Clustering error: {result.error}</p>}
 
       {result && !result.error && (
@@ -300,17 +340,14 @@ export default function ClusteringExperiment() {
                     <span className="muted">{cl.members.length} photos · intra-sim {cl.intra.toFixed(3)}</span>
                   </div>
                   <div className="c-cover">
-                    {view[cl.rep]?.thumbUrl
-                      ? <img src={view[cl.rep].thumbUrl} alt={view[cl.rep].name} />
-                      : <div className="c-cover-fallback">{view[cl.rep]?.name}</div>}
+                    <ThumbImg src={view[cl.rep]?.thumbUrl} alt={view[cl.rep]?.name} />
                     <div className="c-cover-meta">★ representative · {view[cl.rep]?.name} · sim-to-center {cl.repSim?.toFixed(3)}</div>
                   </div>
                   <div className="c-members">
                     {cl.order.map((i) => (
                       <button key={i} className={`c-thumb ${sel === i ? 'sel' : ''}`} onClick={() => setSel(i)} title={`${view[i]?.name} · sil ${result.sil.perPoint[i]?.toFixed(3) ?? 'n/a'}`}>
-                        {view[i]?.thumbUrl
-                          ? <><img src={view[i].thumbUrl} alt={view[i].name} loading="lazy" /><span className="c-cap" title={view[i]?.name}>{view[i]?.name}</span></>
-                          : <span className="c-name">{view[i]?.name}</span>}
+                        <ThumbImg src={view[i]?.thumbUrl} alt={view[i]?.name} />
+                        <span className="c-cap" title={view[i]?.name}>{view[i]?.name}</span>
                         <span className="c-dot" style={{ background: colorFor(cl.id) }} />
                       </button>
                     ))}
