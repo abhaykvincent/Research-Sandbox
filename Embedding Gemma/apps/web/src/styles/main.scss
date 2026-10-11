@@ -274,3 +274,150 @@ main { display: grid; gap: 1.25rem; }
     }
   }
 }
+
+// ---- Milestone 6: storytelling ----
+.story-stats {
+  display: flex;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  align-items: baseline;
+  margin-top: 1rem;
+  font-size: 0.85rem;
+  .stat {
+    border: 1px solid #2c2c36;
+    border-radius: 99px;
+    padding: 0.3rem 0.7rem;
+    strong { color: $accent; }
+  }
+}
+
+.story-player {
+  margin-top: 1rem;
+  background: $bg;
+  border: 1px solid #2c2c36;
+  border-radius: 10px;
+  padding: 0.8rem;
+  .sp-main {
+    display: grid;
+    grid-template-columns: minmax(180px, 320px) 1fr;
+    gap: 0.9rem;
+    align-items: start;
+    @media (max-width: 560px) { grid-template-columns: 1fr; }
+  }
+  .sp-img { width: 100%; height: 220px; object-fit: cover; border-radius: 8px; background: #000; }
+  .sp-cap { font-size: 0.95rem; }
+  .sp-sub { font-size: 0.8rem; margin-top: 0.25rem; overflow-wrap: anywhere; }
+  .sp-bar { height: 6px; background: #2c2c36; border-radius: 99px; overflow: hidden; margin-top: 0.6rem; }
+  .sp-fill { height: 100%; background: $accent; transition: width 0.3s; }
+  .sp-controls { margin-top: 0.7rem; }
+}
+
+.story-strip {
+  display: flex;
+  gap: 0.7rem;
+  overflow-x: auto;
+  padding: 0.4rem 0.1rem 0.6rem;
+  margin-top: 0.5rem;
+}
+.story-frame {
+  flex: 0 0 190px;
+  background: $bg;
+  border: 1px solid #2c2c36;
+  border-top: 3px solid $accent;
+  border-radius: 10px;
+  padding: 0.55rem;
+  &.live { outline: 2px solid #fff; }
+  .sf-thumb {
+    position: relative;
+    display: block;
+    width: 100%;
+    padding: 0;
+    border: 0;
+    background: none;
+    cursor: pointer;
+    img { width: 100%; height: 110px; object-fit: cover; border-radius: 8px; display: block; }
+    .sf-num {
+      position: absolute;
+      left: 6px;
+      bottom: 6px;
+      background: rgba(0, 0, 0, 0.72);
+      color: #fff;
+      font-size: 0.75rem;
+      font-weight: 700;
+      border-radius: 99px;
+      padding: 0.1rem 0.5rem;
+    }
+    .sf-dot { position: absolute; left: 6px; top: 6px; width: 10px; height: 10px; border-radius: 99px; border: 1px solid rgba(0, 0, 0, 0.5); }
+    .sf-cover {
+      position: absolute;
+      right: 6px;
+      top: 6px;
+      background: $accent;
+      color: #101014;
+      font-size: 0.68rem;
+      font-weight: 700;
+      border-radius: 99px;
+      padding: 0.1rem 0.5rem;
+    }
+  }
+  .sf-cap { font-size: 0.75rem; margin-top: 0.4rem; }
+  .sf-name { font-size: 0.7rem; color: $muted; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sf-btns {
+    display: flex;
+    gap: 0.3rem;
+    margin-top: 0.4rem;
+    button {
+      flex: 1;
+      background: $surface;
+      color: $ink;
+      border: 1px solid #2c2c36;
+      border-radius: 6px;
+      padding: 0.25rem 0;
+      cursor: pointer;
+      font-size: 0.75rem;
+      &:disabled { opacity: 0.4; cursor: default; }
+    }
+  }
+}
+
+.story-chapters {
+  display: grid;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+.story-chapter {
+  background: $bg;
+  border: 1px solid #2c2c36;
+  border-left: 3px solid $accent;
+  border-radius: 8px;
+  padding: 0.5rem 0.7rem;
+  font-size: 0.85rem;
+  .sc-names { font-size: 0.75rem; margin-top: 0.2rem; overflow-wrap: anywhere; }
+}
+
+.story-pool {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+  gap: 0.6rem;
+  margin-top: 0.5rem;
+  .pool-item {
+    background: $bg;
+    border: 1px dashed #2c2c36;
+    border-radius: 8px;
+    padding: 0.5rem;
+    display: grid;
+    gap: 0.3rem;
+    img { width: 100%; height: 80px; object-fit: cover; border-radius: 6px; }
+    button {
+      background: $surface;
+      color: $ink;
+      border: 1px solid #2c2c36;
+      border-radius: 6px;
+      padding: 0.3rem;
+      cursor: pointer;
+      font-size: 0.78rem;
+    }
+  }
+}
+
+.story-export { margin-top: 1rem; }

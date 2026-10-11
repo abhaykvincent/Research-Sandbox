@@ -18,6 +18,13 @@ export const createBatch = createAsyncThunk(
       form.append('outputDimensionality', String(outputDimensionality));
       form.append('concurrency', String(concurrency));
       form.append('maxRetries', String(maxRetries));
+      // M6 storytelling orders highlights chronologically — capture the
+      // shoot order from the browser before upload (server stores capturedAt).
+      try {
+        const timestamps = {};
+        files.forEach((f) => { if (f.lastModified > 0) timestamps[f.name] = f.lastModified; });
+        form.append('timestamps', JSON.stringify(timestamps));
+      } catch { /* chrono falls back to file names */ }
       blog.log('POST /api/batch-jobs → sending…');
       const res = await fetch(`${API_URL}/api/batch-jobs`, { method: 'POST', body: form });
       const data = await res.json().catch((e) => ({ _parseError: String(e) }));
