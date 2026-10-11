@@ -133,11 +133,17 @@ function publicBatch(batch, includeVectors = false) {
   return {
     ...batch,
     buffers: undefined,
-    items: batch.items.map((it) => ({
-      ...it,
-      _vector: undefined,
-      vector: includeVectors ? it._vector : undefined,
-    })),
+    items: batch.items.map((it) => {
+      // Vectors are stripped from disk persistence; rehydrate from the
+      // SHA-256 cache so ?includeVectors=true survives server restarts.
+      let vec = it._vector;
+      if (includeVectors && !vec && it.sha256) vec = cacheGet(it.sha256, batch.outputDimensionality)?.values ?? null;
+      return {
+        ...it,
+        _vector: undefined,
+        vector: includeVectors ? (vec ?? undefined) : undefined,
+      };
+    }),
   };
 }
 
