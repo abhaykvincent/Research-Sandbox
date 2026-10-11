@@ -88,6 +88,10 @@ export default function EmbeddingTester() {
             <dd><strong>{current.dimension}</strong></dd>
             <dt>processing time</dt>
             <dd>{current.processingTimeMs} ms</dd>
+            <dt>upload optimized</dt>
+            <dd>{current.sizeBytes != null && current.sentBytes != null
+              ? `${(current.sizeBytes / 1024).toFixed(1)} KB → ${(current.sentBytes / 1024).toFixed(1)} KB${current.bytesSavedPct ? ` (−${current.bytesSavedPct}%)` : ''}${current.resized ? ' · resized' : ''}`
+              : '—'}</dd>
             <dt>model</dt>
             <dd>{current.model}</dd>
             <dt>vector preview (first 12)</dt>
