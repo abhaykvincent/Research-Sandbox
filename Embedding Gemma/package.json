@@ -5,7 +5,8 @@
   "description": "Isolated FotoFlow AI Playground — React + Node + Firebase + Gemini embeddings",
   "type": "module",
   "scripts": {
-    "dev": "concurrently \"npm run dev:api\" \"npm run dev:web\"",
+    "predev": "lsof -ti:5050 | xargs kill -9 2>/dev/null || true",
+    "dev": "lsof -ti:5050 | xargs kill -9 2>/dev/null || true; concurrently \"npm run dev:api\" \"npm run dev:web\"",
     "dev:api": "npm run dev --workspace=services/api",
     "dev:web": "npm run dev --workspace=apps/web",
     "build": "npm run build --workspace=apps/web",
