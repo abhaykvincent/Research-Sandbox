@@ -1,5 +1,5 @@
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, renameSync, unlinkSync, readdirSync } from 'node:fs';
+import { dirname, join, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -9,17 +9,51 @@ mkdirSync(dataDir, { recursive: true });
 const batchFile = join(dataDir, 'batch-jobs.json');
 const cacheFile = join(dataDir, 'embedding-cache.json');
 
+// Sweep tmp files orphaned by a kill between write and atomic rename.
+for (const f of [batchFile, cacheFile]) {
+  try {
+    for (const entry of readdirSync(dataDir)) {
+      if (entry.startsWith(`${basename(f)}.tmp.`)) {
+        try { unlinkSync(join(dataDir, entry)); } catch { /* ignore */ }
+      }
+    }
+  } catch { /* ignore */ }
+}
+// Bound persisted history so batch-jobs.json can't grow to tens of MB
+// (base64 buffers) and block the event loop on every synchronous write.
+const MAX_STORED_BATCHES = 20;
+
 function loadJson(path, fallback) {
   try {
     if (!existsSync(path)) return fallback;
     return JSON.parse(readFileSync(path, 'utf8'));
   } catch {
+    // Main file torn by a mid-write kill — fall back to previous good copy.
+    try {
+      if (existsSync(path + '.bak')) return JSON.parse(readFileSync(path + '.bak', 'utf8'));
+    } catch { /* ignore */ }
     return fallback;
   }
 }
 
+// Atomic write: tmp file + rename, so a kill (nodemon restart) mid-persist
+// can never leave a truncated registry. Previous good copy kept as .bak.
+function saveJsonAtomic(path, obj) {
+  const tmp = `${path}.tmp.${process.pid}`;
+  writeFileSync(tmp, JSON.stringify(obj));
+  try {
+    if (existsSync(path)) {
+      try { renameSync(path, path + '.bak'); } catch { /* ignore */ }
+    }
+    renameSync(tmp, path);
+  } catch (err) {
+    try { unlinkSync(tmp); } catch { /* ignore */ }
+    throw err;
+  }
+}
+
 function saveJson(path, obj) {
-  writeFileSync(path, JSON.stringify(obj, null, 2));
+  saveJsonAtomic(path, obj);
 }
 
 // ---- Embedding cache: sha256 -> { values, dims, model, cachedAt } ----
@@ -43,8 +77,26 @@ export function cacheStats() {
 // ---- Batch job persistence (metadata + previews, not full vectors) ----
 let batches = loadJson(batchFile, {});
 
-function persist() {
+// Prune oversized history on load (keeps newest MAX_STORED_BATCHES).
+try {
+  const ids = Object.values(batches)
+    .sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1))
+    .map((b) => b.batchId);
+  if (ids.length > MAX_STORED_BATCHES) {
+    for (const id of ids.slice(MAX_STORED_BATCHES)) delete batches[id];
+  }
+} catch { /* ignore */ }
+
+let persistTimer = null;
+let persistQueued = false;
+
+function persistNow() {
   try {
+    // Cap stored batches before writing.
+    const ids = Object.values(batches)
+      .sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1))
+      .map((b) => b.batchId);
+    for (const id of ids.slice(MAX_STORED_BATCHES)) delete batches[id];
     // Strip full vectors before writing to disk (vectors stay in memory;
     // re-fetch with ?includeVectors=true only while server runs; cache covers resume)
     const slim = {};
@@ -55,9 +107,40 @@ function persist() {
   } catch { /* ignore */ }
 }
 
+function persist() {
+  // Debounce: progress saves (per-item) coalesce into one disk write so a
+  // 14MB base64 payload doesn't block the event loop on every item.
+  // Final saves call persistNow() via batchSaveNow().
+  if (persistTimer) {
+    persistQueued = true;
+    return;
+  }
+  persistNow();
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    if (persistQueued) {
+      persistQueued = false;
+      persistNow();
+    }
+  }, 500);
+  // Don't keep the process alive for a pending persist.
+  persistTimer.unref?.();
+}
+
 export function batchSave(batch) {
   batches[batch.batchId] = batch;
   persist();
+}
+
+/** Immediate write for run-start / run-done boundaries. */
+export function batchSaveNow(batch) {
+  batches[batch.batchId] = batch;
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+    persistQueued = false;
+  }
+  persistNow();
 }
 export function batchGet(batchId) {
   return batches[batchId] ?? null;

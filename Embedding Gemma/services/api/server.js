@@ -5,13 +5,21 @@ import multer from 'multer';
 import { randomUUID } from 'node:crypto';
 import { EMBED_MODEL, MOCK_MODE, embedWithRetry, sha256 } from './lib/embed.js';
 import { preprocessImage, preprocessConfig, savingsPct } from './lib/image.js';
-import { cacheGet, cacheSet, cacheStats, batchSave, batchGet } from './lib/batchStore.js';
+import { logger } from './lib/logger.js';
+import { cacheGet, cacheSet, cacheStats, batchSave, batchSaveNow, batchGet, batchList } from './lib/batchStore.js';
 
 const app = express();
 const PORT = process.env.PORT || 5050;
 
 app.use(cors());
 app.use(express.json({ limit: '25mb' }));
+
+// Request log: method + path + size hints (helps trace UI → API issues)
+app.use((req, _res, next) => {
+  const len = req.headers['content-length'];
+  logger.debug('http', `${req.method} ${req.path}`, len ? { contentLength: Number(len) } : undefined);
+  next();
+});
 
 // In-memory single-image jobs (M2). Batch jobs persist via batchStore (M3).
 const jobs = new Map();
@@ -43,6 +51,7 @@ const clamp = (n, lo, hi, dflt) => {
 };
 
 app.get('/api/health', (_req, res) => {
+  logger.debug('health', 'ping', { mock: MOCK_MODE, cache: cacheStats(), preprocess: preprocessConfig() });
   res.json({ ok: true, model: EMBED_MODEL, hasKey: Boolean(process.env.GEMINI_API_KEY), mock: MOCK_MODE, cache: cacheStats(), preprocess: preprocessConfig() });
 });
 
@@ -56,24 +65,33 @@ app.post('/api/embeddings', uploadSingle.single('image'), async (req, res) => {
       bytes = req.file.buffer; mimeType = req.file.mimetype;
       outputDimensionality = req.body.outputDimensionality ? Number(req.body.outputDimensionality) : undefined;
       includeVector = req.body.includeVector === 'true' || req.body.includeVector === true;
+      logger.debug('single', 'multipart input', { name: req.file.originalname, bytes: bytes.length, mimeType });
     } else if (req.body?.imageBase64) {
       bytes = Buffer.from(req.body.imageBase64, 'base64');
       mimeType = req.body.mimeType || 'image/jpeg';
       outputDimensionality = req.body.outputDimensionality ? Number(req.body.outputDimensionality) : undefined;
       includeVector = Boolean(req.body.includeVector);
+      logger.debug('single', 'JSON body input', { bytes: bytes.length, mimeType });
       if (bytes.length > 15 * 1024 * 1024) return res.status(413).json({ error: 'Image exceeds 15 MB limit' });
     } else {
+      logger.warn('single', 'no image supplied', { jobId: jobId.slice(0, 8), hasFile: Boolean(req.file), bodyKeys: Object.keys(req.body ?? {}) });
       return res.status(400).json({ error: 'Send multipart `image` file or JSON { imageBase64, mimeType }' });
     }
-    if (outputDimensionality !== undefined && !(outputDimensionality >= 128 && outputDimensionality <= 3072))
+    if (outputDimensionality !== undefined && !(outputDimensionality >= 128 && outputDimensionality <= 3072)) {
+      logger.warn('single', 'bad outputDimensionality', { jobId: jobId.slice(0, 8), outputDimensionality });
       return res.status(400).json({ error: 'outputDimensionality must be 128–3072' });
+    }
 
     jobs.set(jobId, { jobId, status: 'processing', createdAt: new Date().toISOString() });
+    logger.info('single', 'job start', {
+      jobId: jobId.slice(0, 8), via: req.file ? `multipart:${req.file.originalname}` : 'json',
+      bytes: bytes.length, mimeType, outputDimensionality: outputDimensionality ?? 768,
+    });
     // Cost optimization: downscale + JPEG-recompress before the Gemini call.
     // Embeddings don't need full-res originals; 1024px q80 is ~5–15x smaller.
     const originalBytes = bytes.length;
     const originalMimeType = mimeType;
-    const pre = await preprocessImage(bytes, mimeType);
+    const pre = await preprocessImage(bytes, mimeType, `single:${jobId.slice(0, 8)}`);
     bytes = pre.bytes;
     mimeType = pre.mimeType;
     const sentBytes = bytes.length;
@@ -81,8 +99,11 @@ app.post('/api/embeddings', uploadSingle.single('image'), async (req, res) => {
     const dims = outputDimensionality ?? 768;
     let values, cacheHit = false, attempts = 1;
     const cached = cacheGet(hash, dims);
-    if (cached) { values = cached.values; cacheHit = true; }
-    else {
+    if (cached) {
+      values = cached.values; cacheHit = true;
+      logger.info('single', 'cache HIT — skipping Gemini', { jobId: jobId.slice(0, 8), hash: hash.slice(0, 8), dims });
+    } else {
+      logger.debug('single', 'cache MISS — calling Gemini', { jobId: jobId.slice(0, 8), hash: hash.slice(0, 8), sentBytes, mimeType });
       const r = await embedWithRetry({ bytes, mimeType, outputDimensionality, fileHash: hash }, 2);
       values = r.values; attempts = r.attempts;
       cacheSet(hash, { values, dimension: values.length, model: EMBED_MODEL, cachedAt: new Date().toISOString() });
@@ -91,8 +112,10 @@ app.post('/api/embeddings', uploadSingle.single('image'), async (req, res) => {
     const job = { jobId, status: 'succeeded', model: EMBED_MODEL, mimeType: originalMimeType, sizeBytes: originalBytes, sentBytes, bytesSavedPct: savingsPct(originalBytes, sentBytes), resized: pre.resized, sentWidth: pre.width, sentHeight: pre.height, dimension: values.length, outputDimensionality: outputDimensionality ?? null, processingTimeMs, cacheHit, attempts, createdAt: new Date().toISOString(), vectorPreview: values.slice(0, 12), _vector: values };
     jobs.set(jobId, job);
     const { _vector, ...pub } = job;
+    logger.info('single', 'job done', { jobId: jobId.slice(0, 8), dim: values.length, ms: processingTimeMs, cacheHit, attempts, savedPct: job.bytesSavedPct });
     res.json({ ...pub, vector: includeVector ? values : undefined });
   } catch (err) {
+    logger.error('single', 'job FAILED', { jobId: jobId.slice(0, 8), ms: Date.now() - started, error: err.message, stack: err.stack?.split('\n').slice(0, 3).join(' | ') });
     jobs.set(jobId, { jobId, status: 'failed', error: err.message, processingTimeMs: Date.now() - started });
     res.status(err.status || 502).json({ jobId, error: err.message });
   }
@@ -119,24 +142,40 @@ function publicBatch(batch, includeVectors = false) {
 }
 
 async function runBatch(batch, { concurrency, maxRetries }) {
+  logger.info('batch', 'run start', { batchId: batch.batchId.slice(0, 8), total: batch.items.length, concurrency, maxRetries });
   batch.status = 'processing';
+  batch.cancelRequested = false;
   batch.updatedAt = new Date().toISOString();
-  batchSave(batch);
+  batchSaveNow(batch);
 
-  const queue = batch.items.filter((it) => it.status === 'pending' || it.status === 'failed');
+  const queue = batch.items.filter((it) => it.status === 'pending' || it.status === 'failed' || it.status === 'processing');
+  logger.debug('batch', 'queue built', { batchId: batch.batchId.slice(0, 8), queued: queue.length });
   for (const it of queue) {
-    if (it.status === 'failed') { it.status = 'pending'; it.error = null; }
+    if (it.status === 'failed' || it.status === 'processing') { it.status = 'pending'; it.error = null; }
   }
   batchSave(batch);
 
   let cursor = 0;
-  const workers = Array.from({ length: concurrency }, async () => {
+  const workers = Array.from({ length: concurrency }, async (__, wIdx) => {
+    logger.debug('batch', `worker ${wIdx} started`, { batchId: batch.batchId.slice(0, 8) });
     while (cursor < queue.length) {
+      if (batch.cancelRequested) {
+        const item = queue[cursor++];
+        if (item.status === 'pending') {
+          item.status = 'cancelled';
+          item.processingTimeMs = 0;
+        }
+        continue;
+      }
       const item = queue[cursor++];
       const started = Date.now();
       item.status = 'processing';
+      batch.updatedAt = new Date().toISOString();
+      batchSave(batch); // debounced — lets polls show processing instead of stale pending
+      logger.debug('batch', 'item start', { batch: batch.batchId.slice(0, 8), file: item.fileName, idx: `${cursor}/${queue.length}` });
       try {
         const buf = batch.buffers[item.fileName];
+        if (!buf) logger.warn('batch', 'buffer missing for item', { batch: batch.batchId.slice(0, 8), file: item.fileName });
         // Preprocess first so cache key + Gemini bytes are the compressed form.
         let procBytes = null;
         let procMime = item.mimeType;
@@ -144,7 +183,7 @@ async function runBatch(batch, { concurrency, maxRetries }) {
         let sentWidth = null;
         let sentHeight = null;
         if (buf) {
-          const pre = await preprocessImage(Buffer.from(buf, 'base64'), item.mimeType);
+          const pre = await preprocessImage(Buffer.from(buf, 'base64'), item.mimeType, `batch:${item.fileName}`);
           procBytes = pre.bytes;
           procMime = pre.mimeType;
           resized = pre.resized;
@@ -161,8 +200,10 @@ async function runBatch(batch, { concurrency, maxRetries }) {
           item._vector = cached.values;
           item.cacheHit = true;
           item.attempts = 0;
+          logger.debug('batch', 'item cache HIT', { file: item.fileName });
         } else {
           if (!procBytes) throw new Error('File bytes expired (server restarted). Re-upload to resume.');
+          logger.debug('batch', 'item cache MISS — embedding', { file: item.fileName, sentBytes: procBytes.length, mime: procMime });
           const r = await embedWithRetry(
             { bytes: procBytes, mimeType: procMime, outputDimensionality: batch.outputDimensionality, fileHash: item.sha256 },
             maxRetries,
@@ -175,10 +216,12 @@ async function runBatch(batch, { concurrency, maxRetries }) {
         item.status = 'succeeded';
         item.dimension = item._vector.length;
         item.vectorPreview = item._vector.slice(0, 12);
+        logger.debug('batch', 'item ok', { file: item.fileName, dim: item.dimension, ms: Date.now() - started, cacheHit: item.cacheHit, attempts: item.attempts });
       } catch (err) {
         item.status = 'failed';
         item.error = err.message;
         item.attempts = err.attempts ?? maxRetries + 1;
+        logger.error('batch', 'item FAILED', { file: item.fileName, ms: Date.now() - started, error: err.message });
       }
       item.processingTimeMs = Date.now() - started;
       batch.completed = batch.items.filter((i) => i.status === 'succeeded').length;
@@ -191,12 +234,19 @@ async function runBatch(batch, { concurrency, maxRetries }) {
   await Promise.all(workers);
 
   batch.pending = batch.items.filter((i) => i.status === 'pending' || i.status === 'processing').length;
-  batch.status = batch.failed > 0 ? 'completed_with_errors' : 'succeeded';
+  const cancelled = batch.items.filter((i) => i.status === 'cancelled').length;
+  if (batch.cancelRequested || (cancelled > 0 && batch.pending === 0 && batch.failed === 0 && batch.completed + cancelled === batch.items.length)) {
+    batch.status = 'cancelled';
+    batch.pending = 0;
+  } else {
+    batch.status = batch.failed > 0 ? 'completed_with_errors' : 'succeeded';
+  }
   batch.updatedAt = new Date().toISOString();
+  logger.info('batch', 'run done', { batchId: batch.batchId.slice(0, 8), status: batch.status, ok: batch.completed, failed: batch.failed, cancelled });
   // Drop raw buffers once done to bound memory; cache covers future retries.
   // Keep buffers if failures remain so /retry can proceed without re-upload.
   if (batch.failed === 0) batch.buffers = {};
-  batchSave(batch);
+  batchSaveNow(batch);
 }
 
 /** POST /api/batch-jobs — multipart `images` (≤50), fields: outputDimensionality, concurrency, maxRetries. 202 + { batchId }. */
@@ -230,41 +280,136 @@ app.post('/api/batch-jobs', uploadBatch.array('images', 50), async (req, res) =>
     }
     batches.set(batchId, batch);
     batchSave(batch);
+    logger.info('batch', 'created', { batchId: batchId.slice(0, 8), total: files.length, dims: outputDimensionality, concurrency, maxRetries, names: files.map((f) => f.originalname).slice(0, 5) });
     res.status(202).json({ batchId, total: batch.total, status: 'queued' });
     runBatch(batch, { concurrency, maxRetries }).catch((err) => {
+      logger.error('batch', 'run crashed', { batchId: batchId.slice(0, 8), error: err.message, stack: err.stack?.split('\n').slice(0, 3).join(' | ') });
       batch.status = 'failed';
       batch.error = err.message;
       batchSave(batch);
     });
   } catch (err) {
+    logger.error('batch', 'create FAILED', { error: err.message });
     res.status(400).json({ error: err.message });
   }
 });
 
 app.get('/api/batch-jobs/:batchId', (req, res) => {
-  const batch = batchGet(req.params.batchId) ?? batches.get(req.params.batchId);
+  // Prefer live in-memory copy (has processing transitions + full vectors);
+  // fall back to persisted snapshot after a restart.
+  const batch = batches.get(req.params.batchId) ?? batchGet(req.params.batchId);
   if (!batch) return res.status(404).json({ error: 'Unknown batchId' });
   res.json(publicBatch(batch, req.query.includeVectors === 'true'));
 });
 
-/** POST /api/batch-jobs/:batchId/retry — re-run failed items only (resumable). */
+/** POST /api/batch-jobs/:batchId/cancel — stop a queued/processing batch. Pending items → cancelled. */
+app.post('/api/batch-jobs/:batchId/cancel', (req, res) => {
+  const batch = batches.get(req.params.batchId) ?? batchGet(req.params.batchId);
+  if (!batch) return res.status(404).json({ error: 'Unknown batchId' });
+  if (!batches.has(batch.batchId)) batches.set(batch.batchId, batch); // rehydrate after restart
+  const terminal = ['succeeded', 'completed_with_errors', 'failed', 'cancelled'].includes(batch.status);
+  if (terminal) return res.json({ batchId: batch.batchId, status: batch.status, cancelled: 0 });
+  batch.cancelRequested = true;
+  batch.status = 'cancelling';
+  batch.updatedAt = new Date().toISOString();
+  // If no worker is running (e.g. buffers gone after restart), finalize immediately.
+  const workerAlive = batch.status === 'cancelling' && Object.keys(batch.buffers ?? {}).length === 0;
+  if (workerAlive) {
+    for (const it of batch.items) {
+      if (it.status === 'pending' || it.status === 'processing') { it.status = 'cancelled'; it.processingTimeMs ??= 0; }
+    }
+    batch.pending = 0;
+    batch.status = 'cancelled';
+  }
+  batchSaveNow(batch);
+  logger.info('batch', 'cancel requested', { batchId: batch.batchId.slice(0, 8) });
+  res.json({ batchId: batch.batchId, status: batch.status });
+});
+
+/** POST /api/batch-jobs/:batchId/retry — re-run failed AND stuck pending/processing items (resumable). */
 app.post('/api/batch-jobs/:batchId/retry', (req, res) => {
   const batch = batches.get(req.params.batchId) ?? batchGet(req.params.batchId);
   if (!batch) return res.status(404).json({ error: 'Unknown batchId' });
   if (!batches.has(batch.batchId)) batches.set(batch.batchId, batch); // rehydrate after restart
-  const failed = batch.items.filter((i) => i.status === 'failed').length;
-  if (failed === 0) return res.json({ batchId: batch.batchId, retried: 0, status: batch.status });
+  if (batch.status === 'processing' || batch.status === 'cancelling') {
+    const active = batch.items.some((i) => i.status === 'processing');
+    if (active) return res.status(409).json({ error: 'Batch is already processing' });
+  }
+  batch.cancelRequested = false;
+  const stuck = batch.items.filter((i) => i.status === 'failed' || i.status === 'pending' || i.status === 'processing').length;
+  if (stuck === 0) return res.json({ batchId: batch.batchId, retried: 0, status: batch.status });
   if (Object.keys(batch.buffers ?? {}).length === 0)
     return res.status(410).json({ error: 'Original bytes expired after restart. Re-upload the shoot to resume.' });
-  res.json({ batchId: batch.batchId, retried: failed, status: 'processing' });
-  runBatch(batch, { concurrency: batch.concurrency, maxRetries: batch.maxRetries }).catch(() => {});
+  logger.info('batch', 'retry requested', { batchId: batch.batchId.slice(0, 8), retried: stuck });
+  res.json({ batchId: batch.batchId, retried: stuck, status: 'processing' });
+  runBatch(batch, { concurrency: batch.concurrency, maxRetries: batch.maxRetries }).catch((err) => {
+    logger.error('batch', 'retry run crashed', { batchId: batch.batchId.slice(0, 8), error: err.message });
+  });
 });
+
+// Recover in-memory registry + resume batches orphaned by a restart
+// (nodemon reload wipes the fire-and-forget runBatch worker, leaving
+// status=processing / items=pending forever with no worker to finish them).
+for (const persisted of batchList()) {
+  if (!batches.has(persisted.batchId)) batches.set(persisted.batchId, persisted);
+}
+for (const batch of batches.values()) {
+  if (batch.cancelRequested || batch.status === 'cancelled' || batch.status === 'cancelling') {
+    if (batch.status !== 'cancelled') {
+      for (const it of batch.items) {
+        if (it.status === 'pending' || it.status === 'processing') { it.status = 'cancelled'; it.processingTimeMs ??= 0; }
+      }
+      batch.pending = 0;
+      batch.status = 'cancelled';
+      batch.cancelRequested = false;
+      batch.updatedAt = new Date().toISOString();
+      batchSaveNow(batch);
+    }
+    continue;
+  }
+  const orphaned = (batch.status === 'queued' || batch.status === 'processing') &&
+    batch.items.some((i) => i.status === 'pending' || i.status === 'processing');
+  if (orphaned) {
+    logger.warn('batch', 'resuming orphaned batch after (re)start', {
+      batchId: batch.batchId.slice(0, 8),
+      pending: batch.items.filter((i) => i.status !== 'succeeded' && i.status !== 'failed').length,
+      hasBuffers: Object.keys(batch.buffers ?? {}).length > 0,
+    });
+    if (Object.keys(batch.buffers ?? {}).length === 0) {
+      // Bytes are gone — fail fast so the UI stops polling forever.
+      for (const it of batch.items) {
+        if (it.status === 'pending' || it.status === 'processing') {
+          it.status = 'failed';
+          it.error = 'File bytes expired (server restarted). Re-upload to resume.';
+        }
+      }
+      batch.completed = batch.items.filter((i) => i.status === 'succeeded').length;
+      batch.failed = batch.items.filter((i) => i.status === 'failed').length;
+      batch.pending = 0;
+      batch.status = batch.failed > 0 ? 'completed_with_errors' : 'succeeded';
+      batch.updatedAt = new Date().toISOString();
+      batchSaveNow(batch);
+    } else {
+      runBatch(batch, { concurrency: batch.concurrency ?? 4, maxRetries: batch.maxRetries ?? 2 }).catch((err) => {
+        logger.error('batch', 'resumed run crashed', { batchId: batch.batchId.slice(0, 8), error: err.message });
+        batch.status = 'failed';
+        batch.error = err.message;
+        batchSaveNow(batch);
+      });
+    }
+  }
+}
 
 // eslint-disable-next-line no-unused-vars
 app.use((err, _req, res, _next) => {
+  logger.error('http', 'unhandled route error', { error: err.message, stack: err.stack?.split('\n').slice(0, 3).join(' | ') });
   res.status(400).json({ error: err.message });
 });
 
+process.on('unhandledRejection', (reason) => {
+  logger.error('process', 'unhandledRejection', { reason: String(reason)?.slice(0, 500) });
+});
+
 app.listen(PORT, () => {
-  console.log(`[api] listening on http://localhost:${PORT} (model=${EMBED_MODEL}${MOCK_MODE ? ', MOCK' : ''})`);
+  logger.info('api', `listening on http://localhost:${PORT}`, { model: EMBED_MODEL, mock: MOCK_MODE, logLevel: logger.level, preprocess: preprocessConfig() });
 });
