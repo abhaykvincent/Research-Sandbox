@@ -1,0 +1,30 @@
+# Node
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Env — never commit real keys
+.env
+services/api/.env
+apps/web/.env
+functions/.env
+
+# Firebase
+.firebase/
+.firebaserc
+firestore-debug.log
+ui-debug.log
+firebase-debug.log
+*.log
+
+# OS / editor
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# Uploads / local experiment data (keep vectors local for M1–M2)
+uploads/
+data/*.json
+!data/.gitkeep

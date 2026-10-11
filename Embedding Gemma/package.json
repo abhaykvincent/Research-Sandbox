@@ -1,0 +1,26 @@
+{
+  "name": "fotoflow-ai-playground",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Isolated FotoFlow AI Playground — React + Node + Firebase + Gemini embeddings",
+  "type": "module",
+  "scripts": {
+    "predev": "lsof -ti:5050 | xargs kill -9 2>/dev/null || true",
+    "dev": "lsof -ti:5050 | xargs kill -9 2>/dev/null || true; concurrently \"npm run dev:api\" \"npm run dev:web\"",
+    "dev:api": "npm run dev --workspace=services/api",
+    "dev:web": "npm run dev --workspace=apps/web",
+    "build": "npm run build --workspace=apps/web",
+    "install:all": "npm install && npm install --workspace=services/api && npm install --workspace=apps/web"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  },
+  "workspaces": [
+    "apps/web",
+    "services/api",
+    "packages/shared"
+  ],
+  "engines": {
+    "node": ">=20 <25"
+  }
+}
