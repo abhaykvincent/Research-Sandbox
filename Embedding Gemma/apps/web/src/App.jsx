@@ -1,6 +1,7 @@
 import EmbeddingTester from './components/EmbeddingTester.jsx';
 import BatchProcessor from './components/BatchProcessor.jsx';
 import EmbeddingInspector from './components/EmbeddingInspector.jsx';
+import ClusteringExperiment from './components/ClusteringExperiment.jsx';
 
 export default function App() {
   return (
@@ -13,9 +14,10 @@ export default function App() {
         <EmbeddingTester />
         <BatchProcessor />
         <EmbeddingInspector />
+        <ClusteringExperiment />
       </main>
       <footer>
-        <span>M1–M4 · API key stays in services/api only · mock: MOCK_EMBEDDINGS=1</span>
+        <span>M1–M5 · API key stays in services/api only · mock: MOCK_EMBEDDINGS=1</span>
       </footer>
     </div>
   );
