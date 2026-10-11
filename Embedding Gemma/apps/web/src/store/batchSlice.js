@@ -64,6 +64,23 @@ export const retryBatch = createAsyncThunk('batch/retry', async (batchId, { reje
   }
 });
 
+export const cancelBatch = createAsyncThunk('batch/cancel', async (batchId, { rejectWithValue, dispatch }) => {
+  blog.log(`POST /api/batch-jobs/${batchId.slice(0, 8)}/cancel → sending…`);
+  try {
+    const res = await fetch(`${API_URL}/api/batch-jobs/${batchId}/cancel`, { method: 'POST' });
+    const data = await res.json().catch((e) => ({ _parseError: String(e) }));
+    blog.log(`cancel ← ${res.status}`, data);
+    if (!res.ok) throw new Error(data.error || `Cancel failed: ${res.status}`);
+    dispatch(fetchBatch(batchId)); // one final poll to pick up 'cancelled'
+    return data;
+  } catch (err) {
+    blog.error('cancelBatch FAILED', { error: err.message });
+    return rejectWithValue(err.message);
+  }
+});
+
+const TERMINAL = ['succeeded', 'completed_with_errors', 'failed', 'cancelled'];
+
 const batchSlice = createSlice({
   name: 'batch',
   initialState: {
@@ -79,9 +96,20 @@ const batchSlice = createSlice({
       localStorage.setItem(LAST_BATCH_KEY, action.payload);
     },
     clearBatch(state) {
+      // Dismiss: forget the job locally (server keeps whatever state it has).
       state.batch = null;
+      state.batchId = null;
       state.status = 'idle';
       state.error = null;
+      state.polling = false;
+      localStorage.removeItem(LAST_BATCH_KEY);
+      blog.log('batch dismissed (local clear, server untouched)');
+    },
+    stopPolling(state) {
+      // Stop watching but leave the server job running.
+      state.polling = false;
+      if (state.status === 'polling') state.status = state.batch?.status ?? 'idle';
+      blog.log('polling stopped by user (server job keeps running)', { batchId: state.batchId?.slice(0, 8) });
     },
   },
   extraReducers: (builder) => {
@@ -95,19 +123,26 @@ const batchSlice = createSlice({
       .addCase(createBatch.rejected, (state, action) => { state.status = 'failed'; state.error = action.payload; })
       .addCase(fetchBatch.fulfilled, (state, action) => {
         state.batch = action.payload;
-        if (['succeeded', 'completed_with_errors', 'failed'].includes(action.payload.status)) {
+        if (TERMINAL.includes(action.payload.status)) {
           state.status = action.payload.status;
           state.polling = false;
         } else {
-          state.status = 'polling';
+          // 'queued' | 'processing' | 'cancelling' → keep watching
+          state.status = action.payload.status === 'cancelling' ? 'cancelling' : 'polling';
           state.polling = true;
         }
       })
       .addCase(fetchBatch.rejected, (state, action) => { state.error = action.payload; state.polling = false; })
       .addCase(retryBatch.fulfilled, (state) => { state.status = 'polling'; state.polling = true; })
-      .addCase(retryBatch.rejected, (state, action) => { state.error = action.payload; });
+      .addCase(retryBatch.rejected, (state, action) => { state.error = action.payload; })
+      .addCase(cancelBatch.pending, (state) => { state.status = 'cancelling'; })
+      .addCase(cancelBatch.fulfilled, (state, action) => {
+        state.status = action.payload.status ?? 'cancelling';
+        state.polling = true; // keep one more poll cycle to land on 'cancelled'
+      })
+      .addCase(cancelBatch.rejected, (state, action) => { state.error = action.payload; });
   },
 });
 
-export const { setBatchId, clearBatch } = batchSlice.actions;
+export const { setBatchId, clearBatch, stopPolling } = batchSlice.actions;
 export default batchSlice.reducer;

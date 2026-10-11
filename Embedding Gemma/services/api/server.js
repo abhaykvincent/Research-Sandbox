@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { EMBED_MODEL, MOCK_MODE, embedWithRetry, sha256 } from './lib/embed.js';
 import { preprocessImage, preprocessConfig, savingsPct } from './lib/image.js';
 import { logger } from './lib/logger.js';
-import { cacheGet, cacheSet, cacheStats, batchSave, batchGet } from './lib/batchStore.js';
+import { cacheGet, cacheSet, cacheStats, batchSave, batchSaveNow, batchGet, batchList } from './lib/batchStore.js';
 
 const app = express();
 const PORT = process.env.PORT || 5050;
@@ -144,13 +144,14 @@ function publicBatch(batch, includeVectors = false) {
 async function runBatch(batch, { concurrency, maxRetries }) {
   logger.info('batch', 'run start', { batchId: batch.batchId.slice(0, 8), total: batch.items.length, concurrency, maxRetries });
   batch.status = 'processing';
+  batch.cancelRequested = false;
   batch.updatedAt = new Date().toISOString();
-  batchSave(batch);
+  batchSaveNow(batch);
 
-  const queue = batch.items.filter((it) => it.status === 'pending' || it.status === 'failed');
+  const queue = batch.items.filter((it) => it.status === 'pending' || it.status === 'failed' || it.status === 'processing');
   logger.debug('batch', 'queue built', { batchId: batch.batchId.slice(0, 8), queued: queue.length });
   for (const it of queue) {
-    if (it.status === 'failed') { it.status = 'pending'; it.error = null; }
+    if (it.status === 'failed' || it.status === 'processing') { it.status = 'pending'; it.error = null; }
   }
   batchSave(batch);
 
@@ -158,9 +159,19 @@ async function runBatch(batch, { concurrency, maxRetries }) {
   const workers = Array.from({ length: concurrency }, async (__, wIdx) => {
     logger.debug('batch', `worker ${wIdx} started`, { batchId: batch.batchId.slice(0, 8) });
     while (cursor < queue.length) {
+      if (batch.cancelRequested) {
+        const item = queue[cursor++];
+        if (item.status === 'pending') {
+          item.status = 'cancelled';
+          item.processingTimeMs = 0;
+        }
+        continue;
+      }
       const item = queue[cursor++];
       const started = Date.now();
       item.status = 'processing';
+      batch.updatedAt = new Date().toISOString();
+      batchSave(batch); // debounced — lets polls show processing instead of stale pending
       logger.debug('batch', 'item start', { batch: batch.batchId.slice(0, 8), file: item.fileName, idx: `${cursor}/${queue.length}` });
       try {
         const buf = batch.buffers[item.fileName];
@@ -223,13 +234,19 @@ async function runBatch(batch, { concurrency, maxRetries }) {
   await Promise.all(workers);
 
   batch.pending = batch.items.filter((i) => i.status === 'pending' || i.status === 'processing').length;
-  batch.status = batch.failed > 0 ? 'completed_with_errors' : 'succeeded';
+  const cancelled = batch.items.filter((i) => i.status === 'cancelled').length;
+  if (batch.cancelRequested || (cancelled > 0 && batch.pending === 0 && batch.failed === 0 && batch.completed + cancelled === batch.items.length)) {
+    batch.status = 'cancelled';
+    batch.pending = 0;
+  } else {
+    batch.status = batch.failed > 0 ? 'completed_with_errors' : 'succeeded';
+  }
   batch.updatedAt = new Date().toISOString();
-  logger.info('batch', 'run done', { batchId: batch.batchId.slice(0, 8), status: batch.status, ok: batch.completed, failed: batch.failed });
+  logger.info('batch', 'run done', { batchId: batch.batchId.slice(0, 8), status: batch.status, ok: batch.completed, failed: batch.failed, cancelled });
   // Drop raw buffers once done to bound memory; cache covers future retries.
   // Keep buffers if failures remain so /retry can proceed without re-upload.
   if (batch.failed === 0) batch.buffers = {};
-  batchSave(batch);
+  batchSaveNow(batch);
 }
 
 /** POST /api/batch-jobs — multipart `images` (≤50), fields: outputDimensionality, concurrency, maxRetries. 202 + { batchId }. */
@@ -278,26 +295,110 @@ app.post('/api/batch-jobs', uploadBatch.array('images', 50), async (req, res) =>
 });
 
 app.get('/api/batch-jobs/:batchId', (req, res) => {
-  const batch = batchGet(req.params.batchId) ?? batches.get(req.params.batchId);
+  // Prefer live in-memory copy (has processing transitions + full vectors);
+  // fall back to persisted snapshot after a restart.
+  const batch = batches.get(req.params.batchId) ?? batchGet(req.params.batchId);
   if (!batch) return res.status(404).json({ error: 'Unknown batchId' });
   res.json(publicBatch(batch, req.query.includeVectors === 'true'));
 });
 
-/** POST /api/batch-jobs/:batchId/retry — re-run failed items only (resumable). */
+/** POST /api/batch-jobs/:batchId/cancel — stop a queued/processing batch. Pending items → cancelled. */
+app.post('/api/batch-jobs/:batchId/cancel', (req, res) => {
+  const batch = batches.get(req.params.batchId) ?? batchGet(req.params.batchId);
+  if (!batch) return res.status(404).json({ error: 'Unknown batchId' });
+  if (!batches.has(batch.batchId)) batches.set(batch.batchId, batch); // rehydrate after restart
+  const terminal = ['succeeded', 'completed_with_errors', 'failed', 'cancelled'].includes(batch.status);
+  if (terminal) return res.json({ batchId: batch.batchId, status: batch.status, cancelled: 0 });
+  batch.cancelRequested = true;
+  batch.status = 'cancelling';
+  batch.updatedAt = new Date().toISOString();
+  // If no worker is running (e.g. buffers gone after restart), finalize immediately.
+  const workerAlive = batch.status === 'cancelling' && Object.keys(batch.buffers ?? {}).length === 0;
+  if (workerAlive) {
+    for (const it of batch.items) {
+      if (it.status === 'pending' || it.status === 'processing') { it.status = 'cancelled'; it.processingTimeMs ??= 0; }
+    }
+    batch.pending = 0;
+    batch.status = 'cancelled';
+  }
+  batchSaveNow(batch);
+  logger.info('batch', 'cancel requested', { batchId: batch.batchId.slice(0, 8) });
+  res.json({ batchId: batch.batchId, status: batch.status });
+});
+
+/** POST /api/batch-jobs/:batchId/retry — re-run failed AND stuck pending/processing items (resumable). */
 app.post('/api/batch-jobs/:batchId/retry', (req, res) => {
   const batch = batches.get(req.params.batchId) ?? batchGet(req.params.batchId);
   if (!batch) return res.status(404).json({ error: 'Unknown batchId' });
   if (!batches.has(batch.batchId)) batches.set(batch.batchId, batch); // rehydrate after restart
-  const failed = batch.items.filter((i) => i.status === 'failed').length;
-  if (failed === 0) return res.json({ batchId: batch.batchId, retried: 0, status: batch.status });
+  if (batch.status === 'processing' || batch.status === 'cancelling') {
+    const active = batch.items.some((i) => i.status === 'processing');
+    if (active) return res.status(409).json({ error: 'Batch is already processing' });
+  }
+  batch.cancelRequested = false;
+  const stuck = batch.items.filter((i) => i.status === 'failed' || i.status === 'pending' || i.status === 'processing').length;
+  if (stuck === 0) return res.json({ batchId: batch.batchId, retried: 0, status: batch.status });
   if (Object.keys(batch.buffers ?? {}).length === 0)
     return res.status(410).json({ error: 'Original bytes expired after restart. Re-upload the shoot to resume.' });
-  logger.info('batch', 'retry requested', { batchId: batch.batchId.slice(0, 8), retried: failed });
-  res.json({ batchId: batch.batchId, retried: failed, status: 'processing' });
+  logger.info('batch', 'retry requested', { batchId: batch.batchId.slice(0, 8), retried: stuck });
+  res.json({ batchId: batch.batchId, retried: stuck, status: 'processing' });
   runBatch(batch, { concurrency: batch.concurrency, maxRetries: batch.maxRetries }).catch((err) => {
     logger.error('batch', 'retry run crashed', { batchId: batch.batchId.slice(0, 8), error: err.message });
   });
 });
+
+// Recover in-memory registry + resume batches orphaned by a restart
+// (nodemon reload wipes the fire-and-forget runBatch worker, leaving
+// status=processing / items=pending forever with no worker to finish them).
+for (const persisted of batchList()) {
+  if (!batches.has(persisted.batchId)) batches.set(persisted.batchId, persisted);
+}
+for (const batch of batches.values()) {
+  if (batch.cancelRequested || batch.status === 'cancelled' || batch.status === 'cancelling') {
+    if (batch.status !== 'cancelled') {
+      for (const it of batch.items) {
+        if (it.status === 'pending' || it.status === 'processing') { it.status = 'cancelled'; it.processingTimeMs ??= 0; }
+      }
+      batch.pending = 0;
+      batch.status = 'cancelled';
+      batch.cancelRequested = false;
+      batch.updatedAt = new Date().toISOString();
+      batchSaveNow(batch);
+    }
+    continue;
+  }
+  const orphaned = (batch.status === 'queued' || batch.status === 'processing') &&
+    batch.items.some((i) => i.status === 'pending' || i.status === 'processing');
+  if (orphaned) {
+    logger.warn('batch', 'resuming orphaned batch after (re)start', {
+      batchId: batch.batchId.slice(0, 8),
+      pending: batch.items.filter((i) => i.status !== 'succeeded' && i.status !== 'failed').length,
+      hasBuffers: Object.keys(batch.buffers ?? {}).length > 0,
+    });
+    if (Object.keys(batch.buffers ?? {}).length === 0) {
+      // Bytes are gone — fail fast so the UI stops polling forever.
+      for (const it of batch.items) {
+        if (it.status === 'pending' || it.status === 'processing') {
+          it.status = 'failed';
+          it.error = 'File bytes expired (server restarted). Re-upload to resume.';
+        }
+      }
+      batch.completed = batch.items.filter((i) => i.status === 'succeeded').length;
+      batch.failed = batch.items.filter((i) => i.status === 'failed').length;
+      batch.pending = 0;
+      batch.status = batch.failed > 0 ? 'completed_with_errors' : 'succeeded';
+      batch.updatedAt = new Date().toISOString();
+      batchSaveNow(batch);
+    } else {
+      runBatch(batch, { concurrency: batch.concurrency ?? 4, maxRetries: batch.maxRetries ?? 2 }).catch((err) => {
+        logger.error('batch', 'resumed run crashed', { batchId: batch.batchId.slice(0, 8), error: err.message });
+        batch.status = 'failed';
+        batch.error = err.message;
+        batchSaveNow(batch);
+      });
+    }
+  }
+}
 
 // eslint-disable-next-line no-unused-vars
 app.use((err, _req, res, _next) => {

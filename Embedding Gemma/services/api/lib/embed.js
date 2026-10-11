@@ -25,6 +25,18 @@ function mockVector(seedHex, dims) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// A hung Gemini call must not orphan a batch forever (pending with no worker
+// progress). Race every attempt against a timeout so it fails into retry.
+const EMBED_TIMEOUT_MS = Number(process.env.EMBED_TIMEOUT_MS) || 60000;
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    timer.unref?.();
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 export async function embedBuffer({ bytes, mimeType, outputDimensionality, fileHash }) {
   const dims = outputDimensionality ?? 768;
   const short = (fileHash || 'nohash').slice(0, 8);
@@ -52,11 +64,11 @@ export async function embedBuffer({ bytes, mimeType, outputDimensionality, fileH
   logger.debug('embed', 'Gemini request start', { short, mimeType, bytes: bytes.length, dims });
   try {
     const ai = new GoogleGenAI({ apiKey });
-    const response = await ai.models.embedContent({
+    const response = await withTimeout(ai.models.embedContent({
       model: EMBED_MODEL,
       contents: [{ inlineData: { mimeType, data: bytes.toString('base64') } }],
       ...(outputDimensionality ? { config: { outputDimensionality } } : {}),
-    });
+    }), EMBED_TIMEOUT_MS, 'Gemini embedContent');
     const values = response.embeddings?.[0]?.values ?? [];
     logger.debug('embed', 'Gemini request ok', { short, dim: values.length, ms: Date.now() - t0 });
     if (values.length === 0) logger.warn('embed', 'Gemini returned empty embedding', { short, responseKeys: Object.keys(response ?? {}) });
