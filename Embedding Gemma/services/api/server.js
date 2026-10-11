@@ -4,6 +4,7 @@ import cors from 'cors';
 import multer from 'multer';
 import { randomUUID } from 'node:crypto';
 import { EMBED_MODEL, MOCK_MODE, embedWithRetry, sha256 } from './lib/embed.js';
+import { preprocessImage, preprocessConfig, savingsPct } from './lib/image.js';
 import { cacheGet, cacheSet, cacheStats, batchSave, batchGet } from './lib/batchStore.js';
 
 const app = express();
@@ -42,7 +43,7 @@ const clamp = (n, lo, hi, dflt) => {
 };
 
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, model: EMBED_MODEL, hasKey: Boolean(process.env.GEMINI_API_KEY), mock: MOCK_MODE, cache: cacheStats() });
+  res.json({ ok: true, model: EMBED_MODEL, hasKey: Boolean(process.env.GEMINI_API_KEY), mock: MOCK_MODE, cache: cacheStats(), preprocess: preprocessConfig() });
 });
 
 // ---------- M2: single image ----------
@@ -68,6 +69,14 @@ app.post('/api/embeddings', uploadSingle.single('image'), async (req, res) => {
       return res.status(400).json({ error: 'outputDimensionality must be 128–3072' });
 
     jobs.set(jobId, { jobId, status: 'processing', createdAt: new Date().toISOString() });
+    // Cost optimization: downscale + JPEG-recompress before the Gemini call.
+    // Embeddings don't need full-res originals; 1024px q80 is ~5–15x smaller.
+    const originalBytes = bytes.length;
+    const originalMimeType = mimeType;
+    const pre = await preprocessImage(bytes, mimeType);
+    bytes = pre.bytes;
+    mimeType = pre.mimeType;
+    const sentBytes = bytes.length;
     const hash = sha256(bytes);
     const dims = outputDimensionality ?? 768;
     let values, cacheHit = false, attempts = 1;
@@ -79,7 +88,7 @@ app.post('/api/embeddings', uploadSingle.single('image'), async (req, res) => {
       cacheSet(hash, { values, dimension: values.length, model: EMBED_MODEL, cachedAt: new Date().toISOString() });
     }
     const processingTimeMs = Date.now() - started;
-    const job = { jobId, status: 'succeeded', model: EMBED_MODEL, mimeType, sizeBytes: bytes.length, dimension: values.length, outputDimensionality: outputDimensionality ?? null, processingTimeMs, cacheHit, attempts, createdAt: new Date().toISOString(), vectorPreview: values.slice(0, 12), _vector: values };
+    const job = { jobId, status: 'succeeded', model: EMBED_MODEL, mimeType: originalMimeType, sizeBytes: originalBytes, sentBytes, bytesSavedPct: savingsPct(originalBytes, sentBytes), resized: pre.resized, sentWidth: pre.width, sentHeight: pre.height, dimension: values.length, outputDimensionality: outputDimensionality ?? null, processingTimeMs, cacheHit, attempts, createdAt: new Date().toISOString(), vectorPreview: values.slice(0, 12), _vector: values };
     jobs.set(jobId, job);
     const { _vector, ...pub } = job;
     res.json({ ...pub, vector: includeVector ? values : undefined });
@@ -127,16 +136,35 @@ async function runBatch(batch, { concurrency, maxRetries }) {
       const started = Date.now();
       item.status = 'processing';
       try {
+        const buf = batch.buffers[item.fileName];
+        // Preprocess first so cache key + Gemini bytes are the compressed form.
+        let procBytes = null;
+        let procMime = item.mimeType;
+        let resized = false;
+        let sentWidth = null;
+        let sentHeight = null;
+        if (buf) {
+          const pre = await preprocessImage(Buffer.from(buf, 'base64'), item.mimeType);
+          procBytes = pre.bytes;
+          procMime = pre.mimeType;
+          resized = pre.resized;
+          sentWidth = pre.width;
+          sentHeight = pre.height;
+          item.originalBytes ??= item.sizeBytes;
+          item.sentBytes = procBytes.length;
+          item.bytesSavedPct = savingsPct(item.originalBytes, item.sentBytes);
+          item.resized = resized;
+          item.sha256 = sha256(procBytes);
+        }
         const cached = cacheGet(item.sha256, batch.outputDimensionality);
         if (cached) {
           item._vector = cached.values;
           item.cacheHit = true;
           item.attempts = 0;
         } else {
-          const buf = batch.buffers[item.fileName];
-          if (!buf) throw new Error('File bytes expired (server restarted). Re-upload to resume.');
+          if (!procBytes) throw new Error('File bytes expired (server restarted). Re-upload to resume.');
           const r = await embedWithRetry(
-            { bytes: Buffer.from(buf, 'base64'), mimeType: item.mimeType, outputDimensionality: batch.outputDimensionality, fileHash: item.sha256 },
+            { bytes: procBytes, mimeType: procMime, outputDimensionality: batch.outputDimensionality, fileHash: item.sha256 },
             maxRetries,
           );
           item._vector = r.values;
@@ -188,7 +216,8 @@ app.post('/api/batch-jobs', uploadBatch.array('images', 50), async (req, res) =>
       buffers: {},
       items: files.map((f) => ({
         jobId: randomUUID(), fileName: f.originalname, mimeType: f.mimetype,
-        sizeBytes: f.size, sha256: sha256(f.buffer),
+        sizeBytes: f.size, originalBytes: f.size, sentBytes: null, bytesSavedPct: null, resized: false,
+        sha256: sha256(f.buffer),
         status: 'pending', dimension: null, processingTimeMs: null,
         attempts: 0, cacheHit: false, error: null, vectorPreview: null, _vector: null,
       })),

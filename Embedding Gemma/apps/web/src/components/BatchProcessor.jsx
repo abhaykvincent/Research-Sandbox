@@ -85,7 +85,7 @@ export default function BatchProcessor() {
               <li key={it.jobId} className={it.status}>
                 <span>{it.fileName}</span>
                 <span>{it.status}{it.cacheHit ? ' (cached)' : ''}{it.attempts > 1 ? ` · ${it.attempts} tries` : ''}</span>
-                <span>{it.dimension ? `dim ${it.dimension}` : ''}{it.processingTimeMs != null ? ` · ${it.processingTimeMs}ms` : ''}</span>
+                <span>{it.dimension ? `dim ${it.dimension}` : ''}{it.processingTimeMs != null ? ` · ${it.processingTimeMs}ms` : ''}{it.bytesSavedPct ? ` · −${it.bytesSavedPct}% bytes` : ''}</span>
                 {it.error && <span className="error">{it.error}</span>}
               </li>
             ))}
