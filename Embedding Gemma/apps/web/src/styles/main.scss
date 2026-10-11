@@ -84,3 +84,44 @@ body {
   margin-top: 1rem;
   ul { padding-left: 1.1rem; color: $muted; font-size: 0.88rem; }
 }
+
+main { display: grid; gap: 1.25rem; }
+
+.resume input {
+  flex: 1;
+  min-width: 220px;
+  padding: 0.55rem 0.7rem;
+  border-radius: 8px;
+  border: 1px solid #2c2c36;
+  background: $bg;
+  color: $ink;
+}
+
+.batch {
+  margin-top: 1rem;
+  .bar {
+    height: 10px;
+    background: #2c2c36;
+    border-radius: 99px;
+    overflow: hidden;
+    .fill { height: 100%; background: $accent; transition: width 0.4s; }
+  }
+  .items {
+    list-style: none;
+    padding: 0;
+    display: grid;
+    gap: 0.4rem;
+    font-size: 0.88rem;
+    li {
+      display: flex;
+      gap: 1rem;
+      flex-wrap: wrap;
+      padding: 0.5rem 0.7rem;
+      border: 1px solid #2c2c36;
+      border-radius: 8px;
+      &.succeeded { border-color: #234d31; }
+      &.failed { border-color: #5c2626; }
+      &.processing { border-color: $warn; }
+    }
+  }
+}
