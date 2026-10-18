@@ -18,10 +18,16 @@ body {
   font-family: Inter, system-ui, -apple-system, sans-serif;
 }
 
+// Native file inputs have a wide intrinsic minimum; never let one push a card
+// past the viewport.
+input[type='file'] { max-width: 100%; }
+
 .page {
   max-width: 760px;
   margin: 0 auto;
   padding: 2rem 1.25rem 4rem;
+
+  @media (max-width: 560px) { padding: 1.25rem 0.9rem 3rem; }
 
   header h1 { margin: 0 0 0.25rem; letter-spacing: -0.02em; }
   header p { color: $muted; margin: 0 0 1.5rem; }
@@ -33,6 +39,9 @@ body {
   border: 1px solid #2c2c36;
   border-radius: $radius;
   padding: 1.5rem;
+  min-width: 0;
+
+  @media (max-width: 560px) { padding: 1rem; }
 
   h2 { margin-top: 0; }
 }
@@ -42,7 +51,7 @@ body {
 .warn { color: $warn; }
 .error { color: $error; }
 
-.health { margin: 1rem 0; font-size: 0.9rem; }
+.health { margin: 1rem 0; font-size: 0.9rem; overflow-wrap: anywhere; }
 
 .row {
   display: flex;
@@ -78,18 +87,24 @@ body {
   dt { color: $muted; }
   dd { margin: 0; overflow-wrap: anywhere; }
   .vec { font-size: 0.8rem; }
+
+  @media (max-width: 560px) {
+    dl { grid-template-columns: 1fr; gap: 0.15rem; }
+    dt { margin-top: 0.5rem; }
+  }
 }
 
 .history {
   margin-top: 1rem;
   ul { padding-left: 1.1rem; color: $muted; font-size: 0.88rem; }
+  li { overflow-wrap: anywhere; }
 }
 
-main { display: grid; gap: 1.25rem; }
+main { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1.25rem; }
 
 .resume input {
-  flex: 1;
-  min-width: 220px;
+  flex: 1 1 220px;
+  min-width: 0;
   padding: 0.55rem 0.7rem;
   border-radius: 8px;
   border: 1px solid #2c2c36;
@@ -119,6 +134,7 @@ main { display: grid; gap: 1.25rem; }
       padding: 0.5rem 0.7rem;
       border: 1px solid #2c2c36;
       border-radius: 8px;
+      span { overflow-wrap: anywhere; }
       &.succeeded { border-color: #234d31; }
       &.failed { border-color: #5c2626; }
       &.processing { border-color: $warn; }
@@ -131,7 +147,9 @@ main { display: grid; gap: 1.25rem; }
   grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
   gap: 0.6rem;
   margin-top: 1rem;
+  @media (max-width: 560px) { grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); }
   .thumb {
+    min-width: 0;
     background: $bg;
     border: 1px solid #2c2c36;
     border-radius: 8px;
@@ -149,7 +167,7 @@ main { display: grid; gap: 1.25rem; }
   }
 }
 
-.sim-table-wrap { overflow-x: auto; margin-top: 0.5rem; }
+.sim-table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; max-width: 100%; margin-top: 0.5rem; }
 .sim-table {
   border-collapse: collapse;
   font-size: 0.8rem;
@@ -167,7 +185,16 @@ main { display: grid; gap: 1.25rem; }
   display: grid;
   gap: 0.3rem;
   font-size: 0.88rem;
-  li { display: flex; justify-content: space-between; border: 1px solid #2c2c36; border-radius: 8px; padding: 0.4rem 0.7rem; }
+  li {
+    display: flex;
+    gap: 0.6rem;
+    justify-content: space-between;
+    border: 1px solid #2c2c36;
+    border-radius: 8px;
+    padding: 0.4rem 0.7rem;
+    span:first-child { min-width: 0; overflow-wrap: anywhere; }
+    span:last-child { flex: 0 0 auto; color: $muted; }
+  }
 }
 
 .cluster-controls {
@@ -186,9 +213,11 @@ main { display: grid; gap: 1.25rem; }
   &.bad { color: $error; border-color: #5c2626; }
 }
 
-.scatter-wrap { margin-top: 1rem; }
+.scatter-wrap { margin-top: 1rem; max-width: 100%; }
 .scatter {
+  display: block;
   width: 100%;
+  height: auto;
   background: $bg;
   border: 1px solid #2c2c36;
   border-radius: 8px;
@@ -226,8 +255,13 @@ main { display: grid; gap: 1.25rem; }
   grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
   gap: 0.8rem;
   margin-top: 1rem;
+  @media (max-width: 560px) {
+    grid-template-columns: 1fr;
+    gap: 0.6rem;
+  }
 }
 .cluster-card {
+  min-width: 0;
   background: $bg;
   border: 1px solid #2c2c36;
   border-top: 3px solid $accent;
@@ -273,6 +307,11 @@ main { display: grid; gap: 1.25rem; }
       &.sel { outline: 2px solid #fff; }
     }
   }
+
+  @media (max-width: 400px) {
+    .c-cover img { height: 112px; }
+    .c-members { grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); }
+  }
 }
 
 // ---- Milestone 6: storytelling ----
@@ -313,14 +352,23 @@ main { display: grid; gap: 1.25rem; }
 }
 
 .story-strip {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
   gap: 0.7rem;
-  overflow-x: auto;
   padding: 0.4rem 0.1rem 0.6rem;
   margin-top: 0.5rem;
+
+  @media (max-width: 560px) {
+    grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+    gap: 0.55rem;
+  }
+  @media (max-width: 400px) {
+    grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
+    gap: 0.45rem;
+  }
 }
 .story-frame {
-  flex: 0 0 190px;
+  min-width: 0;
   background: $bg;
   border: 1px solid #2c2c36;
   border-top: 3px solid $accent;
@@ -360,7 +408,7 @@ main { display: grid; gap: 1.25rem; }
       padding: 0.1rem 0.5rem;
     }
   }
-  .sf-cap { font-size: 0.75rem; margin-top: 0.4rem; }
+  .sf-cap { font-size: 0.75rem; margin-top: 0.4rem; overflow-wrap: anywhere; }
   .sf-name { font-size: 0.7rem; color: $muted; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .sf-btns {
     display: flex;
@@ -377,6 +425,15 @@ main { display: grid; gap: 1.25rem; }
       font-size: 0.75rem;
       &:disabled { opacity: 0.4; cursor: default; }
     }
+  }
+
+  @media (max-width: 560px) {
+    .sf-thumb img { height: 96px; }
+  }
+  @media (max-width: 400px) {
+    padding: 0.45rem;
+    .sf-thumb img { height: 84px; }
+    .sf-btns button { font-size: 0.7rem; padding: 0.3rem 0; }
   }
 }
 
@@ -400,7 +457,9 @@ main { display: grid; gap: 1.25rem; }
   grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
   gap: 0.6rem;
   margin-top: 0.5rem;
+  @media (max-width: 400px) { grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); }
   .pool-item {
+    min-width: 0;
     background: $bg;
     border: 1px dashed #2c2c36;
     border-radius: 8px;

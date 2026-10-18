@@ -12,9 +12,9 @@ export default function App() {
         <p>Isolated Gemini-embedding experiments — no production data.</p>
       </header>
       <main>
-        <EmbeddingTester />
+        {/* <EmbeddingTester />
         <BatchProcessor />
-        <EmbeddingInspector />
+        <EmbeddingInspector /> */}
         <ClusteringExperiment />
         <StorytellingExperiment />
       </main>
